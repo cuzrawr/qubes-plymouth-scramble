@@ -1,0 +1,152 @@
+
+#------------------------------------ @MARKER@ ------------------------------------
+# Added to the image's copy of the stock theme script by qubes-plymouth-scramble. The boot
+# hook passes the map of this boot in [script-env-vars] (character n is the digit key n
+# types); without a map nothing changes. Under the password field, each column shows a key,
+# an arrow and the digit the key enters. Caps Lock switches to standard digits: the map
+# hides and the dot left of the field turns red (GetCapslockState reads the Caps Lock LED).
+# The stock callbacks run first, so the stock prompt is unchanged.
+
+@DIGIT_STYLE@
+qubes_scramble.cell = 34;
+qubes_scramble.gap = 6;
+qubes_scramble.count = 0;
+qubes_scramble.shown = 0;
+qubes_scramble.drawn = -1;
+
+# Adds an image to column (0-9) of the keypad, dy pixels below its top. Writes go through
+# s, an alias of the existing global object: an alias of a missing element would not create it.
+fun qubes_scramble_add(column, image, dy) {
+    local.s = global.qubes_scramble;
+
+    s.item[s.count].column = column;
+    s.item[s.count].image = image;
+    s.item[s.count].sprite = Sprite(image);
+    s.item[s.count].dy = dy;
+    s.count = s.count + 1;
+}
+
+# Columns in keyboard order 1-9, 0: key cap with the key, arrow, digit it enters, letters
+fun qubes_scramble_build() {
+    local.s = global.qubes_scramble;
+    local.cap = Image("qubes-scramble-keycap.png");
+    local.arrow = Image("qubes-scramble-arrow.png");
+    local.column;
+    local.key;
+    local.digit;
+    local.label;
+    local.text;
+
+    for (column = 0; column < 10; column++) {
+        key = (column + 1) % 10;
+        digit = qubes_scramble_map.CharAt(key);
+        label = Image.Text("" + key, 0.85, 0.87, 0.9, 1, "Sans 12");
+        text = Image.Text(digit, s.red[digit], s.green[digit], s.blue[digit], 1, "Sans Bold 20");
+        qubes_scramble_add(column, cap, 0);
+        qubes_scramble_add(column, label, Math.Int((cap.GetHeight() - label.GetHeight()) / 2));
+        qubes_scramble_add(column, arrow, cap.GetHeight() + 5);
+        qubes_scramble_add(column, text, cap.GetHeight() + 5 + arrow.GetHeight() + 3);
+        if (s.letters[digit] != "")
+            qubes_scramble_add(column, Image.Text(s.letters[digit], 0.72, 0.75, 0.8, 1, "Sans 9"),
+                               cap.GetHeight() + 8 + arrow.GetHeight() + text.GetHeight());
+    }
+    s.note.image = Image.Text("Caps Lock: standard digits", 0.8, 0.8, 0.8, 1, "Sans 11");
+    s.note.sprite = Sprite(s.note.image);
+    s.dot_on = Image("qubes-scramble-dot-on.png");
+    s.dot_off = Image("qubes-scramble-dot-off.png");
+    s.dot = Sprite(s.dot_off);
+}
+
+# Keypad below the password field (and the anti-evil-maid secret, if shown), centred on
+# the field; the note and its dot left of the field, centred on its height. Runs only after
+# the stock prompt callback: reading global.dialog before it exists would create it.
+fun qubes_scramble_layout() {
+    local.s = global.qubes_scramble;
+    local.entry = global.dialog.entry;
+    local.aem = global.dialog.aemsecret;
+    local.x;
+    local.y;
+    local.top;
+    local.left;
+    local.i;
+    local.item;
+
+    if (!entry.sprite)
+        return;
+    x = entry.sprite.GetX();
+    y = entry.sprite.GetY();
+    top = y + entry.image.GetHeight() + 20;
+    if (aem.image.GetHeight())
+        top = aem.sprite.GetY() + aem.image.GetHeight() + 20;
+    left = x + Math.Int(entry.image.GetWidth() / 2) - Math.Int((10 * s.cell + 9 * s.gap) / 2);
+    for (i = 0; i < s.count; i++) {
+        item = s.item[i];
+        item.sprite.SetPosition(left + item.column * (s.cell + s.gap) + Math.Int((s.cell - item.image.GetWidth()) / 2),
+                                top + item.dy, 10);
+    }
+    s.note.sprite.SetPosition(x - 16 - s.note.image.GetWidth(),
+                              y + Math.Int((entry.image.GetHeight() - s.note.image.GetHeight()) / 2), 10);
+    s.dot.SetPosition(x - 24 - s.note.image.GetWidth() - s.dot_on.GetWidth(),
+                      y + Math.Int((entry.image.GetHeight() - s.dot_on.GetHeight()) / 2), 10);
+}
+
+# Map visible while a prompt is shown and Caps Lock is off; note and dot while a prompt is shown
+fun qubes_scramble_update() {
+    local.s = global.qubes_scramble;
+    local.scrambled = !Plymouth.GetCapslockState();
+    local.i;
+
+    if (s.drawn == s.shown * 2 + scrambled)
+        return;
+    s.drawn = s.shown * 2 + scrambled;
+    for (i = 0; i < s.count; i++)
+        s.item[i].sprite.SetOpacity(s.shown && scrambled);
+    if (scrambled)
+        s.dot.SetImage(s.dot_off);
+    else
+        s.dot.SetImage(s.dot_on);
+    s.note.sprite.SetOpacity(s.shown);
+    s.dot.SetOpacity(s.shown);
+}
+
+fun qubes_scramble_display_prompt(prompt, password, is_secret) {
+    display_prompt_callback(prompt, password, is_secret);
+    global.qubes_scramble.shown = 1;
+    qubes_scramble_layout();
+    qubes_scramble_update();
+}
+
+fun qubes_scramble_display_normal() {
+    display_normal_callback();
+    global.qubes_scramble.shown = 0;
+    qubes_scramble_update();
+}
+
+fun qubes_scramble_refresh() {
+    refresh_callback();
+    qubes_scramble_update();
+}
+
+# F1, F2 and F8 type private characters in the scrambled layout (Plymouth passes no function
+# keys from keyboards it reads through XKB): run the stock hotkeys with the escape sequences
+# the stock callback compares, and keep the characters out of the password
+fun qubes_scramble_validate_input(entry_text, add_text) {
+    if (add_text == qubes_scramble_f1)
+        keyboard_input_callback("\e[[A");
+    else if (add_text == qubes_scramble_f2)
+        keyboard_input_callback("\e[[B");
+    else if (add_text == qubes_scramble_f8)
+        keyboard_input_callback("\e[19~");
+    else
+        return 1;
+    return 0;
+}
+
+if (qubes_scramble_map.Length() == 10) {
+    qubes_scramble_build();
+    qubes_scramble_update();
+    Plymouth.SetDisplayPromptFunction(qubes_scramble_display_prompt);
+    Plymouth.SetDisplayNormalFunction(qubes_scramble_display_normal);
+    Plymouth.SetRefreshFunction(qubes_scramble_refresh);
+    Plymouth.SetValidateInputFunction(qubes_scramble_validate_input);
+}

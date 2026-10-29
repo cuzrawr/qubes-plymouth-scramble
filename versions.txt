@@ -1,0 +1,9 @@
+Noteworthy changes in release 0.1.0
+
+* First public release
+
+  Scrambled digit keys for the Qubes OS R4.3 disk password prompt: a dracut
+  module writes a new XKB digit layout into the initramfs on every boot, and a
+  keypad overlay for the stock qubes-dark Plymouth theme shows the mapping.
+  install and uninstall list every change and ask first; uninstall rebuilds the
+  initramfs the way kernel-install does.

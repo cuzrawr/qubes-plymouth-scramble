@@ -1,0 +1,702 @@
+#!/usr/bin/python3
+"""qubes-plymouth-scramble: scrambled digit keys for the Qubes OS disk password prompt.
+
+Stock Plymouth reads keys through XKB when vconsole.conf names an XKB layout. This tool
+installs a dracut module whose boot hook writes a new random digit layout into the
+initramfs (RAM) on every boot and hands the map to a keypad overlay appended to the image's
+copy of the stock qubes-dark theme. Plymouth itself is not modified.
+
+Commands (run as root in dom0; install and uninstall list every change and ask first):
+  install        apply the configuration: generate the dracut module, then build, validate
+                 and switch to new initramfs images for the running kernel and every kernel
+                 whose image has the hook (enabled = no keeps only this tool in the module
+                 directory, which dracut then skips, and builds stock images)
+  uninstall      remove the dracut module (with this tool), its link and the configuration,
+                 then switch to stock images
+  status         show what is installed
+  validate-tree  check a staged or unpacked initramfs (used by the dracut module)
+"""
+
+import argparse
+import configparser
+import ctypes
+import ctypes.util
+import fcntl
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+PROG = "qubes-plymouth-scramble"
+SOURCE_DIR = os.path.dirname(os.path.realpath(__file__))
+INSTALLED_CLI = "/usr/local/sbin/qubes-plymouth-scramble"
+CONFIG_FILE = "/etc/qubes-plymouth-scramble.conf"
+VCONSOLE_CONF = "/etc/vconsole.conf"
+KERNEL_MODULES = "/lib/modules"
+MODULE_DIR = "/usr/lib/dracut/modules.d/91qubes-scramble"
+# Copied into the module's source/ directory: later initramfs builds validate with this tool,
+# and INSTALLED_CLI links to it
+SHARED_FILES = ("qubes-plymouth-scramble", "qubes-plymouth-scramble.conf", "README.md", "dracut", "theme")
+# libxkbcommon searches XKB_EXTRA before XKB_ROOT; /usr is read-only in the initramfs, /etc is not
+XKB_ROOT, XKB_EXTRA = "/usr/share/X11/xkb", "/etc/xkb"
+THEME_DIR = "/usr/share/plymouth/themes/qubes-dark"
+THEME_FILE, THEME_SCRIPT = THEME_DIR + "/qubes-dark.plymouth", THEME_DIR + "/qubes-dark.script"
+# Plymouth looks for themes here first; the boot hook puts the theme file with the map here
+RUNTIME_THEME_FILE = "/run/plymouth/themes/qubes-dark/qubes-dark.plymouth"
+# What the keypad overlay uses from the stock theme script: the callbacks it wraps or calls,
+# their registration, the password field, and the escape sequences of the F1, F2 and F8 hotkeys
+# (a literal ESC as in qubes-dark, or \e). Colours, images and positions may change freely.
+THEME_REQUIREMENTS = [
+    ("fun display_prompt_callback", r"\bfun\s+display_prompt_callback\s*\("),
+    ("fun display_normal_callback", r"\bfun\s+display_normal_callback\s*\("),
+    ("fun refresh_callback", r"\bfun\s+refresh_callback\s*\("),
+    ("fun keyboard_input_callback", r"\bfun\s+keyboard_input_callback\s*\("),
+    ("Plymouth.SetDisplayPromptFunction(display_prompt_callback)",
+     r"\bPlymouth\.SetDisplayPromptFunction\s*\(\s*display_prompt_callback\s*\)"),
+    ("Plymouth.SetDisplayNormalFunction(display_normal_callback)",
+     r"\bPlymouth\.SetDisplayNormalFunction\s*\(\s*display_normal_callback\s*\)"),
+    ("Plymouth.SetRefreshFunction(refresh_callback)", r"\bPlymouth\.SetRefreshFunction\s*\(\s*refresh_callback\s*\)"),
+    ("Plymouth.SetKeyboardInputFunction(keyboard_input_callback)",
+     r"\bPlymouth\.SetKeyboardInputFunction\s*\(\s*keyboard_input_callback\s*\)"),
+    ("global.dialog.entry =", r"\bglobal\.dialog\.entry\s*="),
+    ("entry.sprite", r"\bentry\.sprite\b"),
+    ("entry.image", r"\bentry\.image\b"),
+    ("the F1 sequence ESC[[A", r"(?:\x1b|\\e)\[\[A"),
+    ("the F2 sequence ESC[[B", r"(?:\x1b|\\e)\[\[B"),
+    ("the F8 sequence ESC[19~", r"(?:\x1b|\\e)\[19~"),
+]
+# Console keymap to XKB layout table of systemd (localectl uses it the same way)
+KBD_MODEL_MAP = "/usr/share/systemd/kbd-model-map"
+# Paths inside the initramfs
+IMAGE_CONF = "/etc/qubes-plymouth-scramble.conf"
+IMAGE_HOOK = "/usr/libexec/qubes-plymouth-scramble/qubes-scramble.sh"
+IMAGE_WANTS = "/usr/lib/systemd/system/sysinit.target.wants/qubes-scramble.service"
+IMAGE_RESTORE_WANTS = "/usr/lib/systemd/system/initrd.target.wants/qubes-scramble-restore.service"
+CONSOLE_MAP = "/etc/qubes-scramble.map"
+# Linux key codes of the top-row and keypad keys for the digits 0-9 (as in the boot hook)
+CONSOLE_TOP_CODES = (11, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+CONSOLE_KEYPAD_CODES = (82, 79, 80, 81, 75, 76, 77, 71, 72, 73)
+OVERLAY_MARKER = "qubes-plymouth-scramble keypad"
+IMAGES = [f"qubes-scramble-{name}.png" for name in ("keycap", "arrow", "dot-on", "dot-off")]
+# XKB names of the top-row keys for the digits 0-9, and the private-use characters F1, F2, F8 type
+DIGIT_KEYS = ["AE10"] + [f"AE{number:02d}" for number in range(1, 10)]
+FUNCTION_KEYS = {"FK01": "UF704", "FK02": "UF705", "FK08": "UF70B"}
+XKB_KEYCODE_INVALID = 0xFFFFFFFF
+
+
+class ScrambleError(Exception):
+    """A problem the user has to fix; reported without a traceback."""
+
+
+def expect(condition, message):
+    if not condition:
+        raise ScrambleError(message)
+
+
+def read(path):
+    with open(path, encoding="utf-8") as stream:
+        return stream.read()
+
+
+class Config:
+    """Validated settings from the INI configuration file."""
+
+    def __init__(self, path):
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            with open(path, encoding="ascii") as stream:
+                parser.read_file(stream)
+            self.enabled = parser.getboolean("scramble", "enabled", fallback=True)
+            self.console = parser.getboolean("scramble", "console", fallback=False)
+        except (OSError, UnicodeDecodeError, ValueError, configparser.Error) as error:
+            raise ScrambleError(f"cannot read configuration {path}: {error}") from None
+        scramble = parser["scramble"] if parser.has_section("scramble") else {}
+        unknown = (set(parser.sections()) - {"scramble", "digits"}) | (set(scramble) - {"enabled", "console"})
+        expect(not unknown, f"{path}: unknown sections or settings: {', '.join(sorted(unknown))}")
+        self.letters, self.colors = [""] * 10, [(1.0, 1.0, 1.0)] * 10
+        for key, value in parser["digits"].items() if parser.has_section("digits") else ():
+            match = re.fullmatch(r"([A-Z]{0,8})\s*(#[0-9A-Fa-f]{6})?", value.strip())
+            expect(re.fullmatch(r"[0-9]", key) and match, f"{path}: [digits] '{key} = {value}': expected a "
+                   "digit = up to 8 capital letters and an optional #rrggbb colour")
+            self.letters[int(key)] = match[1]
+            if match[2]:
+                self.colors[int(key)] = tuple(channel / 255 for channel in bytes.fromhex(match[2][1:]))
+
+    @property
+    def hint(self):
+        """Static letter groups printed on the console, or an empty string."""
+        groups = [f"{digit} {letters}" for digit, letters in enumerate(self.letters) if letters]
+        return "Disk password letters: " + ", ".join(groups) if groups else ""
+
+
+class _RuleNames(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_char_p) for name in ("rules", "model", "layout", "variant", "options")]
+
+
+class Xkb:
+    """The libxkbcommon calls that check a keymap the way plymouthd compiles it."""
+
+    def __init__(self):
+        try:
+            lib = ctypes.CDLL(ctypes.util.find_library("xkbcommon") or "libxkbcommon.so.0")
+        except OSError as error:
+            raise ScrambleError(f"cannot load libxkbcommon: {error}") from None
+        p, u32, i32, text = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_char_p
+        for name, restype, argtypes in (
+                ("xkb_context_new", p, [i32]), ("xkb_context_include_path_append", i32, [p, text]),
+                ("xkb_context_unref", None, [p]), ("xkb_keymap_unref", None, [p]),
+                ("xkb_keymap_new_from_names", p, [p, ctypes.POINTER(_RuleNames), i32]),
+                ("xkb_keymap_key_by_name", u32, [p, text]), ("xkb_keymap_num_layouts", u32, [p]),
+                ("xkb_keymap_key_get_syms_by_level", i32, [p, u32, u32, u32, ctypes.POINTER(ctypes.POINTER(u32))]),
+                ("xkb_keysym_get_name", i32, [u32, text, ctypes.c_size_t]), ("xkb_state_new", p, [p]),
+                ("xkb_state_unref", None, [p]), ("xkb_state_update_key", i32, [p, u32, i32]),
+                ("xkb_state_key_get_layout", u32, [p, u32]),
+                ("xkb_state_key_get_utf8", i32, [p, u32, text, ctypes.c_size_t]),
+                ("xkb_state_led_name_is_active", i32, [p, text])):
+            getattr(lib, name).restype, getattr(lib, name).argtypes = restype, argtypes
+        self.lib = lib
+
+    def keymap(self, include_dirs, layout, variant="", options="", model="pc105"):
+        """Compiles a keymap from RMLVO names with only the XKB data in include_dirs, in order."""
+        context = self.lib.xkb_context_new(3)  # no default include paths, no environment names
+        expect(context, "xkb_context_new failed")
+        try:
+            for include_dir in include_dirs:
+                if os.path.isdir(include_dir):
+                    self.lib.xkb_context_include_path_append(context, include_dir.encode())
+            names = _RuleNames(b"evdev", model.encode(), layout.encode(), variant.encode(), options.encode())
+            handle = self.lib.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+        finally:
+            self.lib.xkb_context_unref(context)
+        expect(handle, f"XKB cannot compile layout '{layout}' variant '{variant}' options '{options}'")
+        return Keymap(self.lib, handle)
+
+
+class Keymap:
+    def __init__(self, lib, handle):
+        self.lib, self.handle, self.state = lib, handle, lib.xkb_state_new(handle)
+        if not self.state:
+            lib.xkb_keymap_unref(handle)
+            raise ScrambleError("xkb_state_new failed")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.lib.xkb_state_unref(self.state)
+        self.lib.xkb_keymap_unref(self.handle)
+
+    def key(self, name):
+        code = self.lib.xkb_keymap_key_by_name(self.handle, name.encode())
+        expect(code != XKB_KEYCODE_INVALID, f"the keymap has no key <{name}>")
+        return code
+
+    def num_layouts(self):
+        return self.lib.xkb_keymap_num_layouts(self.handle)
+
+    def syms(self, name, layout, level):
+        """Keysym names of a key at a group and shift level, both counted from 0."""
+        array = ctypes.POINTER(ctypes.c_uint32)()
+        count = self.lib.xkb_keymap_key_get_syms_by_level(self.handle, self.key(name), layout, level,
+                                                         ctypes.byref(array))
+        names = []
+        for index in range(max(count, 0)):
+            buffer = ctypes.create_string_buffer(64)
+            self.lib.xkb_keysym_get_name(array[index], buffer, len(buffer))
+            names.append(buffer.value.decode())
+        return names
+
+    def tap(self, name):
+        for direction in (1, 0):
+            self.lib.xkb_state_update_key(self.state, self.key(name), direction)
+
+    def text(self, name):
+        buffer = ctypes.create_string_buffer(16)
+        self.lib.xkb_state_key_get_utf8(self.state, self.key(name), buffer, len(buffer))
+        return buffer.value.decode()
+
+    def group(self):
+        return self.lib.xkb_state_key_get_layout(self.state, self.key(DIGIT_KEYS[0]))
+
+    def caps_led(self):
+        return bool(self.lib.xkb_state_led_name_is_active(self.state, b"Caps Lock"))
+
+
+def check_keymap(xkb, root, vconsole, digit_map):
+    """The keymap plymouthd compiles from vconsole.conf types the theme's digits; Caps Lock
+    switches to standard digits with its LED on and back; F1, F2, F8 type their private
+    characters and Ctrl+Alt+F1/F2/F8 still switch virtual terminals."""
+    with xkb.keymap((root + XKB_EXTRA, root + XKB_ROOT), vconsole.get("XKBLAYOUT", ""),
+                    vconsole.get("XKBVARIANT", ""), vconsole.get("XKBOPTIONS", "")) as keymap:
+        expect(keymap.num_layouts() == 2, f"the scrambled keymap has {keymap.num_layouts()} groups, not 2")
+        for group, digits in ((0, digit_map), (1, "0123456789")):
+            if group:
+                keymap.tap("CAPS")
+            expect(keymap.group() == group and keymap.caps_led() == bool(group),
+                   f"Caps Lock does not select group {group + 1} with the LED {'on' if group else 'off'}")
+            for digit, key in enumerate(DIGIT_KEYS):
+                expect(keymap.text(key) == digits[digit], f"group {group + 1}: key <{key}> types "
+                       f"{keymap.text(key)!r} instead of {digits[digit]}; layouts that need Shift for "
+                       "digits are not supported")
+                expect(keymap.syms(f"KP{digit}", group, 1) == [f"KP_{digits[digit]}"],
+                       f"group {group + 1}: keypad key <KP{digit}> does not type {digits[digit]}")
+            for key, private in FUNCTION_KEYS.items():
+                vt_switch = f"XF86Switch_VT_{int(key[2:])}"
+                expect(keymap.syms(key, group, 0) == [private] and keymap.syms(key, group, 4) == [vt_switch],
+                       f"group {group + 1}: key <{key}> does not type {private} and switch with {vt_switch}")
+        keymap.tap("CAPS")
+        expect(keymap.group() == 0 and not keymap.caps_led(), "Caps Lock does not switch back")
+
+
+def check_console_map(root, vconsole):
+    """The console keymap the hook wrote loads and maps the top-row digit keys to a permutation
+    of 0-9, with the same digit on the matching keypad key."""
+    expect(vconsole.get("KEYMAP_TOGGLE") == CONSOLE_MAP, "console scrambling: vconsole.conf lacks KEYMAP_TOGGLE")
+    result = subprocess.run(["loadkeys", "-b", root + CONSOLE_MAP], capture_output=True, text=True, check=False)
+    expect(result.returncode == 0, f"loadkeys rejects the console keymap: {result.stderr.strip()}")
+    names = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+    lines = set(read(root + CONSOLE_MAP).splitlines())
+    found = [[digit for digit in range(10) if f"plain keycode {code} = {names[digit]}" in lines]
+             for code in CONSOLE_TOP_CODES]
+    digits = [entries[0] for entries in found if len(entries) == 1]
+    expect(sorted(digits) == list(range(10)) and all(
+        f"plain keycode {code} = KP_{digit}" in lines for code, digit in zip(CONSOLE_KEYPAD_CODES, digits, strict=True)),
+           "console scrambling: the console keymap is not a permutation of the digits")
+
+
+def read_vconsole(path):
+    """KEY=value settings of a vconsole.conf (empty if it does not exist); undecodable bytes
+    never match the names the tool looks for."""
+    values = {}
+    if not os.path.exists(path):
+        return values
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream.read().split("\n"):
+            key, separator, value = line.strip().partition("=")
+            if separator and not key.startswith("#"):
+                values[key.strip()] = value.strip().strip("\"'")
+    return values
+
+
+def read_theme_map(path):
+    """The digit map in the theme file the hook wrote, after checking the F1/F2/F8 characters."""
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    try:
+        parser.read(path, encoding="utf-8")
+    except (UnicodeDecodeError, configparser.Error) as error:
+        raise ScrambleError(f"cannot parse {path}: {error}") from None
+    values = parser["script-env-vars"] if parser.has_section("script-env-vars") else {}
+    digit_map = values.get("qubes_scramble_map", "")
+    expect(sorted(digit_map) == list("0123456789"), f"{path}: qubes_scramble_map is not a permutation of 0-9")
+    for name, private in zip(("f1", "f2", "f8"), FUNCTION_KEYS.values(), strict=True):
+        expect(values.get(f"qubes_scramble_{name}") == chr(int(private[1:], 16)),
+               f"{path}: qubes_scramble_{name} does not match the {private} key of the layout")
+    return digit_map
+
+
+def tree_snapshot(top):
+    """Paths, sizes and modification times of all files below top."""
+    return sorted((os.path.join(directory, name), info.st_size, info.st_mtime_ns)
+                  for directory, _, files in os.walk(top) for name in files
+                  for info in [os.lstat(os.path.join(directory, name))])
+
+
+def check_theme_script(text):
+    """The stock theme script provides what the keypad overlay uses and nothing it replaces."""
+    missing = [description for description, pattern in THEME_REQUIREMENTS if not re.search(pattern, text)]
+    expect(not missing, "the theme script lacks " + "; ".join(missing))
+    expect(not re.search(r"\bPlymouth\.SetValidateInputFunction\b|\bqubes_scramble", text),
+           "the theme script already sets an input filter or has a keypad overlay")
+
+
+def etc_run_files(top):
+    """Contents of the files below /etc and /run of a tree, where the boot hook writes."""
+    files = {}
+    for directory, _, names in [*os.walk(top + "/etc"), *os.walk(top + "/run")]:
+        for name in names:
+            with open(os.path.join(directory, name), "rb") as stream:
+                files[os.path.relpath(os.path.join(directory, name), top)] = stream.read()
+    return files
+
+
+def run_hook_copy(root, cmdline, check):
+    """Runs the boot hook of an initramfs tree on a scratch copy with the kernel command line
+    cmdline, calls check(scratch), then runs the restore step. The hook must not write below
+    /usr, and the restore step must leave /etc and /run as they were."""
+    with tempfile.TemporaryDirectory(prefix=f"{PROG}-") as scratch:
+        for path in (IMAGE_CONF, THEME_FILE, VCONSOLE_CONF):
+            if os.path.exists(root + path):
+                os.makedirs(os.path.dirname(scratch + path), exist_ok=True)
+                shutil.copyfile(root + path, scratch + path)
+        shutil.copytree(root + XKB_ROOT, scratch + XKB_ROOT, symlinks=True)
+        os.mkdir(scratch + "/proc")
+        with open(scratch + "/proc/cmdline", "w", encoding="ascii") as stream:
+            stream.write(cmdline + "\n")
+        usr, before = tree_snapshot(scratch + "/usr"), etc_run_files(scratch)
+        for action in ("scramble", "restore"):
+            result = subprocess.run(["bash", root + IMAGE_HOOK, action], capture_output=True, text=True, check=False,
+                                    env={"PATH": "/usr/bin:/usr/sbin", "LC_ALL": "C", "QUBES_SCRAMBLE_ROOT": scratch})
+            expect(result.returncode == 0, f"boot hook {action} failed: {result.stderr.strip()}")
+            expect(tree_snapshot(scratch + "/usr") == usr, "the boot hook writes below /usr, read-only in the initramfs")
+            if action == "scramble":
+                check(scratch)
+        expect(etc_run_files(scratch) == before, "the restore step leaves the map or a changed vconsole.conf behind")
+
+
+def validate_tree(root, xkb=None):
+    """Checks an initramfs tree: the installed parts, the keyboard layout, and the boot hook
+    with its restore step on copies, for the Plymouth prompt and, with console scrambling,
+    for the text console prompt (Plymouth disabled)."""
+    required = [IMAGE_CONF, IMAGE_HOOK, IMAGE_WANTS, IMAGE_RESTORE_WANTS, THEME_FILE, THEME_SCRIPT,
+                XKB_ROOT + "/rules/evdev"]
+    missing = [path for path in required + [f"{THEME_DIR}/{name}" for name in IMAGES]
+               if not os.path.lexists(root + path)]
+    expect(not missing, "missing in the image: " + ", ".join(missing))
+    stock, marker, _ = read(root + THEME_SCRIPT).partition(OVERLAY_MARKER)
+    expect(marker, "the theme script in the image has no keypad overlay")
+    check_theme_script(stock.rpartition("\n")[0])
+    conf = read(root + IMAGE_CONF).splitlines()
+    layout = system_layout(read_vconsole(root + VCONSOLE_CONF))
+    expect(f"BASE_LAYOUT={shell_quote(layout)}" in conf,
+           f"the image keeps another keyboard layout than the system ({layout}); run {PROG} install again")
+
+    def plymouth_prompt(scratch):
+        check_keymap(xkb or Xkb(), scratch, read_vconsole(scratch + VCONSOLE_CONF),
+                     read_theme_map(scratch + RUNTIME_THEME_FILE))
+
+    def console_prompt(scratch):
+        check_console_map(scratch, read_vconsole(scratch + VCONSOLE_CONF))
+
+    run_hook_copy(root, "quiet", plymouth_prompt)
+    if "CONSOLE_SCRAMBLE=1" in conf:
+        run_hook_copy(root, "quiet plymouth.enable=0", console_prompt)
+
+
+def render_overlay(config, template):
+    """The keypad overlay with the digit letters and colours of the configuration."""
+    lines = [f'qubes_scramble.letters["{digit}"] = "{config.letters[digit]}"; '
+             f'qubes_scramble.red["{digit}"] = {red:.3f}; qubes_scramble.green["{digit}"] = {green:.3f}; '
+             f'qubes_scramble.blue["{digit}"] = {blue:.3f};'
+             for digit, (red, green, blue) in enumerate(config.colors)]
+    text = template.replace("@MARKER@", OVERLAY_MARKER).replace("@DIGIT_STYLE@", "\n".join(lines))
+    expect("@" not in text, "keypad template has unreplaced placeholders")
+    return text
+
+
+def shell_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def system_layout(vconsole, model_map=KBD_MODEL_MAP):
+    """The XKB layout of the system keyboard, e.g. us or de(nodeadkeys), which the prompt keeps
+    for everything but the digits: the first XKBLAYOUT and XKBVARIANT of vconsole.conf, else
+    the layout systemd maps the console KEYMAP to (the kernel's built-in keymap is us)."""
+    layout, variant = vconsole.get("XKBLAYOUT", ""), vconsole.get("XKBVARIANT", "")
+    if not layout:
+        keymap = vconsole.get("KEYMAP") or "us"
+        try:
+            lines = read(model_map).splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ScrambleError(f"cannot read {model_map}: {error}") from None
+        fields = next((line.split() for line in lines
+                       if line.split()[:1] == [keymap] and not line.lstrip().startswith("#")), [])
+        expect(len(fields) >= 4, f"{model_map} has no XKB layout for the console keymap '{keymap}'")
+        layout, variant = fields[1], "" if fields[3] == "-" else fields[3]
+    layout, variant = layout.split(",")[0], variant.split(",")[0]
+    expect(re.fullmatch(r"[a-z][a-z0-9_-]*", layout) and re.fullmatch(r"[A-Za-z0-9_-]*", variant),
+           f"unsupported keyboard layout '{layout}' variant '{variant}'")
+    return f"{layout}({variant})" if variant else layout
+
+
+def module_conf(config, base_layout):
+    """The shell configuration read by the boot hook and the dracut module."""
+    return "".join(f"{key}={value}\n" for key, value in (
+        ("BASE_LAYOUT", shell_quote(base_layout)), ("THEME_FILE", shell_quote(THEME_FILE)),
+        ("RUNTIME_THEME_FILE", shell_quote(RUNTIME_THEME_FILE)), ("THEME_SCRIPT", shell_quote(THEME_SCRIPT)),
+        ("CONSOLE_SCRAMBLE", int(config.console)), ("HINT", shell_quote(config.hint))))
+
+
+def check_theme():
+    """The active theme is qubes-dark, and its script and theme file suit the keypad overlay."""
+    try:
+        active = subprocess.run(["plymouth-set-default-theme"], capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise ScrambleError(f"cannot run plymouth-set-default-theme: {error}") from None
+    expect(active.stdout.strip() == "qubes-dark", f"the active Plymouth theme is '{active.stdout.strip()}', not qubes-dark")
+    check_theme_script(read(THEME_SCRIPT))
+    expect(not re.search(r"^\[script-env-vars\]", read(THEME_FILE), re.MULTILINE),
+           f"{THEME_FILE} already has [script-env-vars]")
+
+
+def write_module(directory, config, base_layout):
+    """Writes the dracut module into an empty directory: module-setup.sh, this tool with its
+    templates in source/ and, if enabled, the files made from the configuration. Without
+    them, dracut skips the module (see check() in module-setup.sh)."""
+    os.chmod(directory, 0o755)
+    os.mkdir(os.path.join(directory, "source"))
+    for name in SHARED_FILES:
+        source, target = os.path.join(SOURCE_DIR, name), os.path.join(directory, "source", name)
+        (shutil.copytree if os.path.isdir(source) else shutil.copy2)(source, target)
+    shutil.copy2(os.path.join(SOURCE_DIR, "dracut", "module-setup.sh"), directory)
+    if not config.enabled:
+        return
+    with open(os.path.join(directory, "qubes-plymouth-scramble.conf"), "w", encoding="ascii") as stream:
+        stream.write(module_conf(config, base_layout))
+    with open(os.path.join(directory, "keypad.script"), "w", encoding="ascii") as stream:
+        stream.write(render_overlay(config, read(os.path.join(SOURCE_DIR, "theme", "keypad.script.in"))))
+
+
+def run(command, **kwargs):
+    try:
+        subprocess.run(command, check=True, **kwargs)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ScrambleError(f"{' '.join(command)} failed: {error}") from None
+
+
+def boot_image(kernel):
+    return f"/boot/initramfs-{kernel}.img"
+
+
+def image_has_hook(image):
+    result = subprocess.run(["lsinitrd", image], capture_output=True, text=True, check=False)
+    expect(result.returncode == 0, f"lsinitrd cannot list {image}: {result.stderr.strip()}")
+    return IMAGE_HOOK.lstrip("/") in result.stdout
+
+
+def hooked_kernels():
+    """Installed kernels whose initramfs has the scramble hook."""
+    return [kernel for kernel in sorted(os.listdir(KERNEL_MODULES))
+            if os.path.isfile(boot_image(kernel)) and image_has_hook(boot_image(kernel))]
+
+
+def boot_layout(kernel):
+    """The boot loader layout kernel-install detects for the kernel: bls or other."""
+    try:
+        result = subprocess.run(["kernel-install", "inspect", kernel, f"/boot/vmlinuz-{kernel}"],
+                                capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise ScrambleError(f"cannot run kernel-install: {error}") from None
+    match = re.search(r"^\s*Layout:\s*(\S+)", result.stdout, re.MULTILINE)
+    expect(match, f"kernel-install inspect shows no layout for {kernel}: {result.stderr.strip()}")
+    expect(match[1] in ("bls", "other"), f"kernel-install uses the {match[1]} layout, which {PROG} does not support")
+    return match[1]
+
+
+def dracut_command(kernel, output):
+    """The dracut call of 50-dracut.install, the initramfs plugin of kernel-install, for the
+    kernel, with output as the image file; the plugin adds --no-uefi for the bls layout."""
+    no_uefi = ["--no-uefi"] if boot_layout(kernel) == "bls" else []
+    return ["dracut", "-f", "--kernel-image", f"/boot/vmlinuz-{kernel}", *no_uefi, "--kver", kernel, output]
+
+
+def build_and_switch(kernels, with_hook):
+    """Builds and checks a new initramfs for each kernel, then replaces the current images.
+
+    dracut runs as when kernel-install adds a kernel package (the other plugins of
+    kernel-install rewrite the boot loader configuration and are not run), into a temporary
+    output file. The current images stay untouched until every new one passed its checks; no
+    copies are kept."""
+    suffix = f".{PROG}-new"
+    try:
+        for kernel in kernels:
+            new = boot_image(kernel) + suffix
+            run(dracut_command(kernel, new))
+            with tempfile.TemporaryDirectory(prefix=f"{PROG}-", dir="/var/tmp") as unpacked:
+                run(["lsinitrd", "--unpack", new], cwd=unpacked, stdout=subprocess.DEVNULL)
+                expect(os.path.lexists(unpacked + IMAGE_WANTS) == with_hook,
+                       f"the new image for {kernel} has no scramble hook (see the dracut warning above)"
+                       if with_hook else f"the new image for {kernel} still has the scramble hook")
+                if with_hook:
+                    validate_tree(unpacked)
+        for image in map(boot_image, kernels):
+            os.replace(image + suffix, image)
+    finally:
+        for image in map(boot_image, kernels):
+            if os.path.exists(image + suffix):
+                os.unlink(image + suffix)
+
+
+def apply(staged, kernels, with_hook):
+    """Switches the dracut module (a staged directory, or None to remove it) and the initramfs
+    images of the kernels together; the old module comes back if a new image fails."""
+    # A leading dot keeps dracut from taking the old copy for a module
+    previous = os.path.join(os.path.dirname(MODULE_DIR), f".{os.path.basename(MODULE_DIR)}.{PROG}-old")
+    shutil.rmtree(previous, ignore_errors=True)
+    if os.path.exists(MODULE_DIR):
+        os.rename(MODULE_DIR, previous)
+    try:
+        if staged:
+            os.rename(staged, MODULE_DIR)
+        build_and_switch(kernels, with_hook)
+    except BaseException:
+        shutil.rmtree(MODULE_DIR, ignore_errors=True)
+        if os.path.exists(previous):
+            os.rename(previous, MODULE_DIR)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
+    os.sync()
+
+
+def confirm(command, changes, assume_yes):
+    """Lists every change of the command and asks before any is made; False if there is none."""
+    if not changes:
+        print(f"{PROG}: nothing to change")
+        return False
+    print(f"{PROG} {command} makes these changes:")
+    for action, path, note in changes:
+        print(f"  {action:8} {path}" + (f"  ({note})" if note else ""))
+    print("Nothing else changes: GRUB, the kernel command line, the dracut, console and Plymouth settings,\n"
+          "the theme files and LUKS stay as they are. Temporary files are removed at the end.")
+    if assume_yes:
+        return True
+    expect(sys.stdin.isatty(), "confirmation needed: run in a terminal or pass --yes")
+    try:
+        answer = input("Proceed? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    expect(answer.strip().lower() in ("y", "yes"), "cancelled; nothing was changed")
+    return True
+
+
+def change(path, note):
+    return ("replace" if os.path.lexists(path) else "add", path, note)
+
+
+def cmd_install(args):
+    path = args.config or (CONFIG_FILE if os.path.exists(CONFIG_FILE) else os.path.join(SOURCE_DIR, f"{PROG}.conf"))
+    config = Config(path)
+    if config.enabled:
+        check_theme()
+    base_layout = system_layout(read_vconsole(VCONSOLE_CONF)) if config.enabled else ""
+    if config.enabled and config.console:
+        expect(re.fullmatch(r"[A-Za-z0-9._-]+", read_vconsole(VCONSOLE_CONF).get("KEYMAP", "")),
+               "console scrambling needs a KEYMAP in /etc/vconsole.conf")
+    running = os.uname().release
+    expect(os.path.isfile(boot_image(running)), f"{boot_image(running)} not found")
+    hooked = hooked_kernels()
+    # Enabled: the running kernel and every kernel with the module; disabled: those with the module
+    kernels = sorted({running, *hooked}) if config.enabled else hooked
+    new_config = not os.path.exists(CONFIG_FILE)
+    if config.enabled:
+        module_note = (f"dracut module with this tool, made from the settings and the system keyboard layout "
+                       f"{base_layout}; later initramfs builds include it")
+        image_note = "as on kernel updates, with the module; replaced after validation"
+    else:
+        module_note = "this tool only: disabled, initramfs builds skip it"
+        image_note = "as on kernel updates, without the module; replaced after validation"
+    changes = [change(MODULE_DIR, module_note)] + [("rebuild", boot_image(kernel), image_note) for kernel in kernels]
+    changes += [("add", CONFIG_FILE, f"copy of {path}")] if new_config else []
+    changes.append(change(INSTALLED_CLI, "link to the tool in the module"))
+    confirm(f"install (settings: {path})", changes, args.yes)
+    staged = tempfile.mkdtemp(prefix=f".{PROG}-", dir=os.path.dirname(MODULE_DIR))
+    try:
+        write_module(staged, config, base_layout)
+        if new_config:
+            shutil.copyfile(path, CONFIG_FILE)
+        # The module and settings reach the disk before anything is switched
+        os.sync()
+        apply(staged, kernels, config.enabled)
+    except BaseException:
+        if new_config and os.path.exists(CONFIG_FILE):
+            os.unlink(CONFIG_FILE)
+        raise
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+    link = f"{INSTALLED_CLI}.{PROG}-new"
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(os.path.join(MODULE_DIR, "source", PROG), link)
+    os.replace(link, INSTALLED_CLI)
+    print(f"{PROG}: installed; the disk password prompt scrambles the digit keys on every boot" if config.enabled
+          else f"{PROG}: disabled; every initramfs has the stock password prompt")
+
+
+def cmd_uninstall(args):
+    hooked = hooked_kernels()
+    changes = [("remove", MODULE_DIR, "")] if os.path.exists(MODULE_DIR) else []
+    changes += [("rebuild", boot_image(kernel), "as on kernel updates, without the module") for kernel in hooked]
+    files = [path for path in (INSTALLED_CLI, CONFIG_FILE) if os.path.lexists(path)]
+    changes += [("remove", path, "your settings" if path == CONFIG_FILE else "") for path in files]
+    if not confirm("uninstall", changes, args.yes):
+        return
+    apply(None, hooked, with_hook=False)
+    for path in files:
+        os.unlink(path)
+    print(f"{PROG}: removed; every initramfs is a stock dracut build again")
+
+
+def cmd_status(_args):
+    module = "not installed"
+    if os.path.exists(MODULE_DIR):
+        module = "installed" if os.path.exists(MODULE_DIR + "/qubes-plymouth-scramble.conf") else "installed, disabled"
+    try:
+        check_theme_script(read(THEME_SCRIPT))
+        theme = "compatible"
+    except (OSError, ScrambleError) as error:
+        theme = f"not usable: {error}"
+    rows = [("configuration", CONFIG_FILE if os.path.exists(CONFIG_FILE) else "none"),
+            ("dracut module", module), ("theme script", theme)]
+    rows += [("initramfs", f"{image} {'scrambles' if image_has_hook(image) else 'is stock'}")
+             for image in map(boot_image, sorted(os.listdir(KERNEL_MODULES))) if os.path.isfile(image)]
+    for label, value in rows:
+        print(f"{label + ':':20}{value}")
+
+
+def lock_modules_dir():
+    """Locks the dracut modules directory against a concurrent run until this process exits
+    (validate-tree, run by dracut, takes no lock); returns the descriptor holding the lock."""
+    try:
+        descriptor = os.open(os.path.dirname(MODULE_DIR), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as error:
+        raise ScrambleError(f"cannot open {os.path.dirname(MODULE_DIR)}: {error}") from None
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise ScrambleError(f"another {PROG} run is in progress") from None
+    return descriptor
+
+
+def cmd_validate_tree(args):
+    validate_tree(os.path.realpath(args.tree))
+    print(f"{PROG}: {args.tree} passed validation")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    install = commands.add_parser("install", help="apply the configuration")
+    install.add_argument("--config", help=f"configuration file (default {CONFIG_FILE}, else the bundled one)")
+    install.set_defaults(handler=cmd_install, needs_root=True)
+    uninstall = commands.add_parser("uninstall", help="restore the stock prompt")
+    uninstall.set_defaults(handler=cmd_uninstall, needs_root=True)
+    for command in (install, uninstall):
+        command.add_argument("-y", "--yes", action="store_true", help="make the listed changes without asking")
+    # The initramfs images are readable by root only
+    commands.add_parser("status", help="show the installation state").set_defaults(handler=cmd_status,
+                                                                                  needs_root=True)
+    validate = commands.add_parser("validate-tree", help="check an initramfs tree")
+    validate.add_argument("tree")
+    validate.set_defaults(handler=cmd_validate_tree, needs_root=False)
+    args = parser.parse_args(argv)
+    # SystemExit runs the same rollback as a failure or Ctrl+C
+    for number in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(number, lambda signum, _frame: sys.exit(128 + signum))
+    try:
+        if args.needs_root:
+            expect(os.geteuid() == 0, "run as root in dom0")
+            lock_modules_dir()
+        args.handler(args)
+    except ScrambleError as error:
+        sys.stdout.flush()
+        print(f"{PROG}: error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

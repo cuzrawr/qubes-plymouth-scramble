@@ -1,0 +1,11 @@
+# qubes-plymouth-scramble: once the disk is unlocked, or before an emergency shell, delete the
+# map of this boot and restore vconsole.conf and the console keymap. Initramfs only.
+[Unit]
+Description=Remove the scrambled digit layout after the disk password prompt
+DefaultDependencies=no
+After=cryptsetup.target plymouth-start.service
+Before=initrd.target emergency.service rescue.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/qubes-plymouth-scramble/qubes-scramble.sh restore

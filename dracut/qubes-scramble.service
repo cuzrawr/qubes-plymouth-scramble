@@ -1,0 +1,12 @@
+# qubes-plymouth-scramble: new scrambled digit layout for the disk password prompt, every boot.
+# Initramfs only. Must finish before plymouthd and systemd-vconsole-setup read vconsole.conf.
+[Unit]
+Description=Scrambled digit keys for the disk password prompt
+DefaultDependencies=no
+Before=plymouth-start.service systemd-vconsole-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/qubes-plymouth-scramble/qubes-scramble.sh
+StandardOutput=journal+console
+StandardError=journal+console
