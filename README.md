@@ -12,6 +12,39 @@ mapping of the keys 0-9; the stock Qubes Plymouth prompt shows it under the pass
 A camera that sees only the keyboard records keys, not the digits. Caps Lock switches to
 standard digits; a dot left of the field lights red while standard digits are active.
 
+
+## Fast install procedure
+
+One-time setup, for people in a hurry:
+
+Requires Qubes OS 4.3 with an encrypted disk (the disk password prompt at boot) and the
+stock qubes-dark boot theme.
+
+1. In a networked qube, download the project:
+
+```sh
+curl -fL --create-dirs -o ~/Downloads/qubes-plymouth-scramble.tar.gz \
+    https://github.com/cuzrawr/qubes-plymouth-scramble/archive/refs/heads/main.tar.gz
+```
+
+2. In dom0, replace `DOWNLOAD_QUBE` with that qube's name:
+
+```sh
+qvm-run --pass-io DOWNLOAD_QUBE 'cat ~/Downloads/qubes-plymouth-scramble.tar.gz' > qubes-plymouth-scramble.tar.gz
+tar -xzf qubes-plymouth-scramble.tar.gz
+cd qubes-plymouth-scramble-main
+sudo ./qubes-plymouth-scramble install
+```
+
+   `install` lists every change and asks before making any. Files copied into dom0 run as
+   root there; read them in the download qube first if in doubt. The unpacked directory
+   can be deleted afterwards: the installation keeps its own copy.
+
+3. Reboot. Below the password field, the prompt shows which digit each key enters in this
+   boot. Type the passphrase with those keys; Caps Lock switches to standard digits.
+
+Remove it again with `sudo qubes-plymouth-scramble uninstall`.
+
 ## Passphrases
 
 Any passphrase works, also words mixed with digits: only the unshifted digit keys (top row
@@ -49,8 +82,7 @@ password field the overlay uses (checked at install and at every initramfs build
 
 ## Install (dom0)
 
-Copy this directory to dom0 (for example `qvm-run --pass-io <qube> 'tar -cf - -C ~
-qubes-plymouth-scramble' | tar -xf -`), then:
+Copy the project to dom0 as in the fast install procedure, then:
 
 ```sh
 sudo ./qubes-plymouth-scramble install    # lists the changes, asks y/N
