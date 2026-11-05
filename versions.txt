@@ -1,0 +1,31 @@
+Noteworthy changes in release 0.1.1
+
+* Only the Plymouth prompt is scrambled
+
+  The text console prompt, used when Plymouth is disabled on the kernel
+  command line, keeps standard digits; console scrambling and the console
+  letter hint are gone. Delete the console line from
+  /etc/qubes-plymouth-scramble.conf before running install; install names it
+  otherwise and changes nothing.
+
+* Masked digits
+
+  display = highpass, hybrid or white draws the digits as images after the
+  IllusionPIN paper (arXiv 1708.06508): readable up close, fading with
+  distance. install makes them in dom0 for the connected screens with the
+  stock numpy and Pillow. text stays the default.
+
+* The keypad follows the F1 message
+
+  After F1 the Caps Lock note no longer touches the stock message that
+  replaces the password field.
+
+Noteworthy changes in release 0.1.0
+
+* First public release
+
+  Scrambled digit keys for the Qubes OS R4.3 disk password prompt: a dracut
+  module writes a new XKB digit layout into the initramfs on every boot, and a
+  keypad overlay for the stock qubes-dark Plymouth theme shows the mapping.
+  install and uninstall list every change and ask first; uninstall rebuilds the
+  initramfs the way kernel-install does.
