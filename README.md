@@ -56,8 +56,13 @@ display = text
 ```
 
 - `display`: `hybrid` (default), `highpass`, `white` or `text`.
+- `size`: digit size as a factor; the shipped settings use 1.5, without the line it is 1. Key
+  caps keep their size.
+- `panel`: masked digits on one grey panel (`yes`, default) or on separate tiles (`no`).
 - Masked digits are made for the screens connected at install: run `install` again after
   changing screens.
+- A screen that cannot show masked digits (no reported size, or too coarse at Plymouth's scale)
+  gets text digits; `install` names it.
 - Only the digit keys move: letters and symbols type as before. Caps Lock switches the digits
   instead of capitalizing; use Shift for capitals.
 - Keyboard layouts that need Shift for digits (for example fr) are refused.

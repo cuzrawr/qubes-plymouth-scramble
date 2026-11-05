@@ -107,7 +107,7 @@ def read(path):
 
 # Settings of [scramble]; the masked-digit names follow the IllusionPIN paper (see the settings file)
 SETTINGS = ("enabled", "display", "safety_distance", "highpass_filter", "highpass_cutoff", "camera_floor",
-            "lowpass_sigma", "quantization", "ppi")
+            "lowpass_sigma", "quantization", "size", "panel", "ppi")
 
 
 class Config:
@@ -119,6 +119,7 @@ class Config:
             with open(path, encoding="ascii") as stream:
                 parser.read_file(stream)
             self.enabled = parser.getboolean("scramble", "enabled", fallback=True)
+            self.panel = parser.getboolean("scramble", "panel", fallback=True)
         except (OSError, UnicodeDecodeError, ValueError, configparser.Error) as error:
             raise ScrambleError(f"cannot read configuration {path}: {error}") from None
         scramble = parser["scramble"] if parser.has_section("scramble") else {}
@@ -152,6 +153,7 @@ class Config:
         expect(self.quantization in QUANTIZATIONS, f"{path}: quantization = {self.quantization}: expected "
                f"{', '.join(QUANTIZATIONS)}")
         self.ppi = number("ppi", None, 50, 1000, "screen pixels per inch")
+        self.size = number("size", 1.0, 0.5, 3, "times the default digit size")
         self.letters, self.colors = [""] * 10, [(1.0, 1.0, 1.0)] * 10
         styles = parser.items("digits", raw=True) if parser.has_section("digits") else []
         expect(self.display == "text" or not styles, f"{path}: display = {self.display} draws the digits as images "
@@ -408,13 +410,21 @@ def render_overlay(config, template, manifest=None):
              f'qubes_scramble.blue["{digit}"] = {blue:.3f};'
              for digit, (red, green, blue) in enumerate(config.colors)]
     sets = manifest["sets"] if manifest else []
-    tiles = [f"qubes_scramble.sets = {len(sets)};"] + [
-        f'qubes_scramble.set[{index}].prefix = "{tiles["prefix"]}"; qubes_scramble.set[{index}].keyed = '
-        f'{int(manifest["display"] == "hybrid")}; qubes_scramble.set[{index}].cell = {tiles["cell"]}; '
-        f'qubes_scramble.set[{index}].width = {tiles["width"]}; qubes_scramble.set[{index}].height = {tiles["height"]};'
-        for index, tiles in enumerate(sets)]
+    tiles = [f"qubes_scramble.sets = {len(sets)};"]
+    for index, entry in enumerate(sets):
+        if "text" in entry:  # a screen that cannot show masked digits
+            tiles.append(f"qubes_scramble.set[{index}].text = 1; qubes_scramble.set[{index}].width = {entry['width']}; "
+                         f"qubes_scramble.set[{index}].height = {entry['height']};")
+            continue
+        panel = entry["panel"]["name"] if "panel" in entry else ""
+        tiles.append(f'qubes_scramble.set[{index}].prefix = "{entry["prefix"]}"; qubes_scramble.set[{index}].keyed = '
+                     f'{int(manifest["display"] == "hybrid")}; qubes_scramble.set[{index}].cell = {entry["cell"]}; '
+                     f'qubes_scramble.set[{index}].width = {entry["width"]}; qubes_scramble.set[{index}].height = '
+                     f'{entry["height"]}; qubes_scramble.set[{index}].panel = "{panel}";')
+    layout = (f"qubes_scramble.cell = {CAP_CELL}; qubes_scramble.gap = {COLUMN_GAP}; qubes_scramble.margin = "
+              f'{PANEL_MARGIN}; qubes_scramble.digit_font = "Sans Bold {round(DIGIT_FONT_PT * config.size)}";')
     text = (template.replace("@MARKER@", OVERLAY_MARKER).replace("@DIGIT_STYLE@", "\n".join(lines))
-            .replace("@TILE_SETS@", "\n".join(tiles)))
+            .replace("@TILE_SETS@", "\n".join(tiles)).replace("@LAYOUT@", layout))
     expect("@" not in text, "keypad template has unreplaced placeholders")
     return text
 
@@ -801,6 +811,14 @@ def edid_mode(data):
 # Tile design: tile and digit height in mm, high-pass and decoy gains in linear light, background
 # code, and the white keypad's button as a share of the tile
 TILE_MM, DIGIT_MM, ALPHA, BETA, PEDESTAL_CODE, BUTTON_SHARE = 9.0, 5.5, 0.35, 0.3, 130, 0.8
+MIN_TILE_PX = 24  # smaller tiles leave the high-pass digit too few pixels to read
+# Keypad layout in Plymouth logical pixels, shared with the overlay: the narrowest column (key cap
+# 30 px), the gap between columns, the margin of the digit panel, the key caps and arrows above the
+# digits with their gaps, and text digits at size 1 in points
+CAP_CELL, COLUMN_GAP, PANEL_MARGIN, KEY_ROWS_PX, DIGIT_FONT_PT = 34, 6, 6, 52, 20
+# The stock dialog below the screen centre (half the logo, prompt and field with their gaps, about
+# 170 px) and a bottom margin: the keypad has the rest of the screen height
+STOCK_BELOW_CENTRE_PX = 180
 TILE_PREFIX = "qubes-scramble-tile"
 TILE_MANIFEST = "qubes-scramble-tiles.json"
 DRM_CLASS = "/sys/class/drm"
@@ -838,19 +856,18 @@ def connected_displays(root=""):
 def tile_targets(config, displays):
     """The tile sets to make: one per scale Plymouth may give a connected display (its EDID rule
     and its simpledrm guess), with the logical size the overlay recognises it by and the logical
-    density; duplicates merged. Without a display that reports its size, one set from ppi."""
+    density; duplicates merged. Without any display, one set for any screen. ppi sets the density;
+    a display without a physical size and no ppi gives targets without one (text digits)."""
     targets = []
     for connector, width, height, width_mm, height_mm in displays:
         ppi = config.ppi or ((width * 25.4 / width_mm + height * 25.4 / height_mm) / 2 if width_mm and height_mm else None)
-        expect(ppi, f"display {connector} reports no physical size; set ppi in the settings")
         for scale in sorted({plymouth_device_scale(width, height, width_mm, height_mm),
                              plymouth_device_scale(width, height, 0, 0, guess=True)}):
             target = {"display": connector, "scale": scale, "width": width // scale, "height": height // scale,
-                      "ppi": round(ppi / scale, 2)}
+                      "ppi": round(ppi / scale, 2) if ppi else None}
             if target not in targets:
                 targets.append(target)
     if not targets:
-        expect(config.ppi, "no connected display reports its size (EDID); set ppi in the settings")
         targets.append({"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": config.ppi})
     return targets
 
@@ -860,7 +877,8 @@ def target_text(target):
     pixels, and the Plymouth scale."""
     scale = target["scale"]
     mode = f" {target['width'] * scale}x{target['height'] * scale}" if target["width"] else ""
-    return f"{target['display']}{mode} at {round(target['ppi'] * scale, 1):g} ppi, Plymouth scale {scale}"
+    density = f" at {round(target['ppi'] * scale, 1):g} ppi" if target["ppi"] else ""
+    return f"{target['display']}{mode}{density}, Plymouth scale {scale}"
 
 
 def estimated_safety_distance(light, decoys, ppi):
@@ -887,14 +905,20 @@ def distance_text(distance_cm):
     return f"{distance_cm} cm" if distance_cm else "under 10 cm"
 
 
-def tile_maker(config, font, ppi):
-    """(make, tile_px, frequency) for tiles at ppi logical pixels per inch: make(cutoff, keys) gives
-    the (light, decoys) of the tiles for a high-pass cut-off in cycles per mm, for the given keys
-    or all."""
-    tile_px = 2 * round(TILE_MM * ppi / 25.4 / 2)
-    masks = digit_masks(font, round(DIGIT_MM * ppi / 25.4), tile_px)
+def tile_pixels(size, ppi):
+    """Side in pixels (even) of a tile at size times the default digit size and ppi pixels per inch."""
+    return 2 * round(TILE_MM * size * ppi / 25.4 / 2)
+
+
+def tile_maker(config, font, ppi, size=1.0):
+    """(make, tile_px, frequency) for tiles at ppi logical pixels per inch and size times the default
+    digit size: make(cutoff, keys) gives the (light, decoys) of the tiles for a high-pass cut-off in
+    cycles per mm, for the given keys or all. The cut-off stays in cycles per mm at any size; the
+    decoy's low-pass width scales with the digit, so a larger decoy keeps its blur."""
+    tile_px = tile_pixels(size, ppi)
+    masks = digit_masks(font, round(DIGIT_MM * size * ppi / 25.4), tile_px)
     frequency = spatial_frequencies(tile_px)
-    low = lowpass_gain(frequency, cycles_per_pixel(config.lowpass_sigma, ppi))
+    low = lowpass_gain(frequency, cycles_per_pixel(config.lowpass_sigma / size, ppi))
     design = TileDesign(ALPHA, PEDESTAL_CODE, 0.0 if config.display == "highpass" else BETA,
                         button_mask(tile_px, round(BUTTON_SHARE * tile_px)) if config.display == "white" else None)
 
@@ -920,31 +944,90 @@ def search_sample(display):
     return [(None, digit) for digit in range(10)]
 
 
-def tile_set(config, font, target):
-    """Codes of the tiles of one target, their size in pixels, the high-pass cut-off in cycles per
-    mm and the estimated safety distance in cm. auto runs the paper's search (protection_width)
-    from camera_floor up to the finest cut-off the screen can show."""
-    ppi = target["ppi"]
-    make, tile_px, frequency = tile_maker(config, font, ppi)
-    # finest cut-off the screen shows with room for the pattern: 0.35 (tapered: lower edge) or 0.3
-    # (Gaussian: sigma) cycles per pixel, against the Nyquist frequency of 0.5
-    limit = (0.35 if config.highpass_filter == "tapered" else 0.3) * ppi / 25.4
+def keypad_row(tile_px, panel):
+    """Width and height in logical pixels of the digit row, the panel when there is one."""
+    margin = 2 * PANEL_MARGIN if panel else 0
+    return 10 * max(CAP_CELL, tile_px) + 9 * COLUMN_GAP + margin, tile_px + margin
+
+
+def check_keypad_fit(config, target, tile_px, where):
+    """Refuses a digit size whose keypad does not fit the target's logical screen: the digit row
+    within the width less 40 px, key caps, arrows and digits below the stock dialog. Names the
+    largest size that fits."""
+    if not target["width"]:
+        return
+    row_width, row_height = keypad_row(tile_px, config.panel)
+    room_width = target["width"] - 40
+    room_height = target["height"] // 2 - STOCK_BELOW_CENTRE_PX - KEY_ROWS_PX
+    if row_width <= room_width and row_height <= room_height:
+        return
+    margin = row_height - tile_px
+    largest_tile = min((room_width - 9 * COLUMN_GAP - margin) // 10, room_height - margin)
+    largest = max(math.floor(20 * config.size * largest_tile / tile_px) / 20, 0)
+    raise ScrambleError(f"{where}: digits at size {config.size:g} need a digit row of {row_width}x{row_height} px, the "
+                        f"screen leaves {room_width}x{max(room_height, 0)} px under the key caps; use size {largest:g} "
+                        "or less")
+
+
+def finest_cutoff(config, ppi):
+    """The finest high-pass cut-off in cycles per mm a screen of ppi shows with room for the pattern:
+    0.35 (tapered: lower edge) or 0.3 (Gaussian: sigma) cycles per pixel, against the Nyquist
+    frequency of 0.5."""
+    return (0.35 if config.highpass_filter == "tapered" else 0.3) * ppi / 25.4
+
+
+def masked_digits_unavailable(config, target):
+    """Why a target cannot show masked digits, or None: no density known, tiles too small at the
+    configured size, or a cut-off (highpass_cutoff, else camera_floor) finer than its pixels. Such a
+    screen gets text digits."""
+    if not target["ppi"]:
+        return ("no connected display reports its physical size" if target["display"] == "unknown"
+                else "it reports no physical size") + "; set ppi in the settings for masked digits"
+    tile_px = tile_pixels(config.size, target["ppi"])
+    if tile_px < MIN_TILE_PX:
+        return f"size {config.size:g} makes {tile_px} px tiles, under {MIN_TILE_PX} px"
+    limit = finest_cutoff(config, target["ppi"])
+    name, cutoff = (("highpass_cutoff", config.highpass_cutoff) if config.highpass_cutoff is not None
+                    else ("camera_floor", config.camera_floor or 0.1))
+    if cutoff > limit:
+        return f"{name} {cutoff:g} cycles per mm is finer than the screen shows (at most {limit:.2f})"
+    return None
+
+
+def highpass_cutoff(config, make, ppi, where):
+    """The high-pass cut-off in cycles per mm for tiles made by make (tile_maker) on a screen that can
+    show masked digits (masked_digits_unavailable): the configured one, or auto's search
+    (protection_width) from camera_floor up to the finest cut-off the screen shows."""
+    if config.highpass_cutoff is not None:
+        return config.highpass_cutoff
+    floor, limit = config.camera_floor or 0.1, finest_cutoff(config, ppi)
     sample = search_sample(config.display)
+    cutoff = protection_width(lambda value: make(value, sample), ppi, Observer(10 * config.safety_distance), (floor, limit))
+    if cutoff is None:
+        reachable = estimated_safety_distance(*make(limit, sample), ppi)
+        raise ScrambleError(f"{where} cannot keep a safety distance of {config.safety_distance:g} cm (the paper's "
+                            f"model); the finest pattern it shows keeps an estimated {distance_text(reachable)}")
+    return cutoff
+
+
+def tile_set(config, font, target):
+    """Codes of the tiles of one target that can show masked digits (masked_digits_unavailable), their
+    size in pixels, the high-pass cut-off in cycles per mm and the estimated safety distance in cm.
+    auto runs the paper's search (protection_width) from camera_floor up to the finest cut-off the
+    screen can show. Search and estimate use the default digit size, the geometry the paper's
+    threshold fits: at a fixed cut-off the outline keeps its width while a larger digit grows, so the
+    per-tile MSSIM rises with size although the digit gets easier to read, and the tapered filter
+    leaves nothing below the cut-off at any size. The tiles are drawn at the configured size with
+    that cut-off."""
+    ppi = target["ppi"]
     where = f"display {target_text(target)}"
-    if config.highpass_cutoff is None:
-        floor = config.camera_floor or 0.1
-        expect(floor <= limit, f"{where}: camera_floor {floor} cycles per mm is finer than the screen shows "
-               f"(at most {limit:.2f}); lower camera_floor or set highpass_cutoff")
-        cutoff = protection_width(lambda value: make(value, sample), ppi, Observer(10 * config.safety_distance),
-                                  (floor, limit))
-        if cutoff is None:
-            reachable = estimated_safety_distance(*make(limit, sample), ppi)
-            raise ScrambleError(f"{where} cannot keep a safety distance of {config.safety_distance:g} cm (the paper's "
-                                f"model); the finest pattern it shows keeps an estimated {distance_text(reachable)}")
-    else:
-        cutoff = config.highpass_cutoff
-        expect(cutoff <= limit, f"{where}: highpass_cutoff {cutoff:g} cycles per mm is finer than the screen shows "
-               f"(at most {limit:.2f})")
+    tile_px = tile_pixels(config.size, ppi)
+    check_keypad_fit(config, target, tile_px, where)
+    make, _, frequency = tile_maker(config, font, ppi)
+    cutoff = highpass_cutoff(config, make, ppi, where)
+    estimate = estimated_safety_distance(*make(cutoff, search_sample(config.display)), ppi)
+    if config.size != 1:
+        make, _, frequency = tile_maker(config, font, ppi, config.size)
     light, _ = make(cutoff)
     if config.quantization == "diffusion":
         codes = diffused_codes(light)
@@ -952,7 +1035,7 @@ def tile_set(config, font, target):
         codes, _ = scale2_tile_codes(light, (frequency < cycles_per_pixel(cutoff, ppi)).astype(float))
     else:
         codes = tile_codes(light)
-    return codes, tile_px, cutoff, estimated_safety_distance(*make(cutoff, sample), ppi)
+    return codes, tile_px, cutoff, estimate
 
 
 def tile_png(codes):
@@ -963,30 +1046,48 @@ def tile_png(codes):
     return buffer.getvalue()
 
 
+def tile_files(config, font, prefix, target):
+    """PNG files of the tile set of one target as {name: bytes}, and its manifest entry."""
+    codes, tile_px, cutoff, estimate = tile_set(config, font, target)
+    names = {prefix + ("" if decoy is None else f"{decoy}-") + f"{digit}.png": tile_png(image)
+             for (decoy, digit), image in sorted(codes.items(), key=str)}
+    tiles = {**target, "prefix": prefix, "cell": tile_px, "cutoff": round(cutoff, 3), "estimated_safety_distance_cm": estimate,
+             "files": {name: hashlib.sha256(data).hexdigest() for name, data in names.items()}}
+    if config.panel:
+        # one opaque panel in the background code under the digit row, so no gap shows between tiles
+        width, height = keypad_row(tile_px, True)
+        panel = tile_png(imaging()[0].full((height, width), PEDESTAL_CODE, dtype="uint8"))
+        tiles["panel"] = {"name": prefix + "panel.png", "width": width, "height": height,
+                          "sha256": hashlib.sha256(panel).hexdigest()}
+        names[prefix + "panel.png"] = panel
+    return names, tiles
+
+
 def make_tiles(config, displays, font):
     """PNG files of the tile sets for the connected displays as {name: bytes}, and their manifest
-    (names with SHA-256, design and estimates) for the overlay and the image validation."""
+    (names with SHA-256, design and estimates) for the overlay and the image validation. A target
+    that cannot show masked digits gets a text set: its size and the reason, no files."""
     with open(font, "rb") as stream:
         font_hash = hashlib.sha256(stream.read()).hexdigest()
     files, sets = {}, []
     for index, target in enumerate(tile_targets(config, displays)):
-        codes, tile_px, cutoff, estimate = tile_set(config, font, target)
-        prefix = f"{TILE_PREFIX}{index}-"
-        names = {prefix + ("" if decoy is None else f"{decoy}-") + f"{digit}.png": tile_png(image)
-                 for (decoy, digit), image in sorted(codes.items(), key=str)}
+        reason = masked_digits_unavailable(config, target)
+        if reason:
+            sets.append({**target, "text": reason})
+            continue
+        names, tiles = tile_files(config, font, f"{TILE_PREFIX}{index}-", target)
         files.update(names)
-        sets.append({**target, "prefix": prefix, "cell": tile_px, "cutoff": round(cutoff, 3),
-                     "estimated_safety_distance_cm": estimate,
-                     "files": {name: hashlib.sha256(data).hexdigest() for name, data in names.items()}})
+        sets.append(tiles)
     return files, {"version": 1, "display": config.display, "highpass_filter": config.highpass_filter,
                    "safety_distance_cm": config.safety_distance, "camera_floor": config.camera_floor,
-                   "lowpass_sigma": config.lowpass_sigma, "quantization": config.quantization,
-                   "font": {"file": font, "sha256": font_hash}, "sets": sets}
+                   "lowpass_sigma": config.lowpass_sigma, "quantization": config.quantization, "size": config.size,
+                   "panel": config.panel, "font": {"file": font, "sha256": font_hash}, "sets": sets}
 
 
 def check_tiles(directory, manifest_path):
     """The tiles in directory match their manifest: every file present with its SHA-256, an opaque
-    8-bit RGB PNG of the set's cell size, 100 per set for hybrid and 10 otherwise."""
+    8-bit RGB PNG of the set's cell size, 100 per set for hybrid and 10 otherwise, and the panel of
+    a set, if any, of the size of its digit row. Text sets name their reason and have no files."""
     try:
         with open(manifest_path, encoding="ascii") as stream:
             manifest = json.load(stream)
@@ -995,20 +1096,34 @@ def check_tiles(directory, manifest_path):
     expect(manifest.get("version") == 1 and manifest.get("display") in MASK_MODES and manifest.get("sets"),
            f"{manifest_path}: not a version 1 tile manifest with sets")
     for tiles in manifest["sets"]:
+        if "text" in tiles:
+            expect(isinstance(tiles["text"], str) and tiles["text"] and "files" not in tiles,
+                   f"{manifest_path}: a text set needs a reason and no tiles")
+            continue
         expect(len(tiles["files"]) == (100 if manifest["display"] == "hybrid" else 10),
                f"{manifest_path}: set {tiles['prefix']} has {len(tiles['files'])} tiles")
-        header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">IIBB", tiles["cell"], tiles["cell"], 8, 2)
         for name, digest in tiles["files"].items():
             expect(re.fullmatch(re.escape(tiles["prefix"]) + r"([0-9]-)?[0-9]\.png", name), f"{manifest_path}: bad tile "
                    f"name {name!r}")
-            try:
-                with open(os.path.join(directory, name), "rb") as stream:
-                    data = stream.read()
-            except OSError as error:
-                raise ScrambleError(f"tile {name} is not readable: {error}") from None
-            expect(data.startswith(header), f"tile {name} is not an 8-bit RGB PNG of {tiles['cell']} px")
-            expect(hashlib.sha256(data).hexdigest() == digest, f"tile {name} does not match its manifest")
+            check_png(directory, name, (tiles["cell"], tiles["cell"]), digest)
+        if "panel" in tiles:
+            panel = tiles["panel"]
+            expect(panel["name"] == tiles["prefix"] + "panel.png" and (panel["width"], panel["height"])
+                   == keypad_row(tiles["cell"], True), f"{manifest_path}: set {tiles['prefix']} has a bad panel entry")
+            check_png(directory, panel["name"], (panel["width"], panel["height"]), panel["sha256"])
     return manifest
+
+
+def check_png(directory, name, size, digest):
+    """A tile image in directory is an opaque 8-bit RGB PNG of size (width, height) with this SHA-256."""
+    header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">IIBB", *size, 8, 2)
+    try:
+        with open(os.path.join(directory, name), "rb") as stream:
+            data = stream.read()
+    except OSError as error:
+        raise ScrambleError(f"tile {name} is not readable: {error}") from None
+    expect(data.startswith(header), f"tile {name} is not an 8-bit RGB PNG of {size[0]}x{size[1]} px")
+    expect(hashlib.sha256(data).hexdigest() == digest, f"tile {name} does not match its manifest")
 
 
 def shell_quote(value):
@@ -1203,6 +1318,9 @@ def cmd_install(args):
         check_theme()
     base_layout = system_layout(read_vconsole(VCONSOLE_CONF)) if config.enabled else ""
     tiles = make_tiles(config, connected_displays(), system_font()) if config.enabled and config.display != "text" else None
+    for entry in tiles[1]["sets"] if tiles else ():
+        if "text" in entry:
+            print(f"{PROG}: note: {target_text(entry)} shows text digits, not masked digits: {entry['text']}")
     running = os.uname().release
     expect(os.path.isfile(boot_image(running)), f"{boot_image(running)} not found")
     hooked = hooked_kernels()
@@ -1261,15 +1379,20 @@ def cmd_uninstall(args):
 
 def tile_summary(manifest):
     """One line per tile set of a manifest, for the change list and status; a set estimated safe from
-    under READABLE_CM is flagged as hard to read for the user too."""
+    under READABLE_CM is flagged as hard to read for the user too, a text set names its reason."""
     def readable(distance):
         return "" if distance is None or distance >= READABLE_CM else " (too close: you may not read these digits either)"
 
-    return "; ".join(
-        f"{manifest['display']} digit tiles ({manifest['highpass_filter']} filter, cut-off {tiles['cutoff']} cycles per mm, "
-        f"quantization {manifest['quantization']}) "
-        f"for {target_text(tiles)}, estimated safety distance {distance_text(tiles['estimated_safety_distance_cm'])}"
-        f"{readable(tiles['estimated_safety_distance_cm'])}" for tiles in manifest["sets"])
+    def line(tiles):
+        if "text" in tiles:
+            return f"text digits for {target_text(tiles)}, which cannot show masked digits: {tiles['text']}"
+        return (f"{manifest['display']} digit tiles ({manifest['highpass_filter']} filter, cut-off {tiles['cutoff']} cycles "
+                f"per mm, quantization {manifest['quantization']}{size}) for {target_text(tiles)}, estimated safety "
+                f"distance {distance_text(tiles['estimated_safety_distance_cm'])}"
+                f"{readable(tiles['estimated_safety_distance_cm'])}")
+
+    size = f", size {manifest['size']:g}" if manifest.get("size", 1) != 1 else ""
+    return "; ".join(line(tiles) for tiles in manifest["sets"])
 
 
 def cmd_status(_args):

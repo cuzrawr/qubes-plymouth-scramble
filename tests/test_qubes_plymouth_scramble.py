@@ -124,6 +124,11 @@ def write_image_conf(root, layout="us"):
     write(root + scramble.IMAGE_CONF, scramble.module_conf(layout))
 
 
+def imaging_image(data):
+    """A PNG from bytes as a Pillow image."""
+    return scramble.imaging()[1].Image.open(io.BytesIO(data))
+
+
 def bold_font():
     """A bold sans-serif font of the system (masked digit tests), or None."""
     try:
@@ -200,7 +205,9 @@ class ConfigTest(unittest.TestCase):
                               ("safety_distance = far", "safety_distance = far: expected a number"),
                               ("highpass_cutoff = 0", "highpass_cutoff = 0: expected a number from 0.1 to 10"),
                               ("camera_floor = -1", "camera_floor = -1: expected a number from 0 to 10"),
-                              ("ppi = nan", "ppi = nan: expected a number from 50 to 1000")):
+                              ("ppi = nan", "ppi = nan: expected a number from 50 to 1000"),
+                              ("size = 4", "size = 4: expected a number from 0.5 to 3"),
+                              ("panel = maybe", "cannot read configuration")):
             with self.subTest(text=text), self.assertRaisesRegex(scramble.ScrambleError, message):
                 config_from(f"[scramble]\n{text}\n")
         with self.assertRaisesRegex(scramble.ScrambleError, "display = white draws the digits as images without letters"):
@@ -663,10 +670,19 @@ class InstallFlowTest(FlowTestCase):
         with open(f"{scramble.MODULE_DIR}/tiles/{scramble.TILE_MANIFEST}", encoding="ascii") as stream:
             manifest = json.load(stream)
         self.assertEqual(sorted(os.listdir(scramble.MODULE_DIR + "/tiles")),
-                         sorted([scramble.TILE_MANIFEST, *manifest["sets"][0]["files"]]))
+                         sorted([scramble.TILE_MANIFEST, *manifest["sets"][0]["files"], manifest["sets"][0]["panel"]["name"]]))
         self.assertIn("highpass digit tiles (tapered filter, cut-off 1.0 cycles per mm, quantization diffusion) for "
                       "HDMI-A-1 1920x1080", output)
         self.assertIn("qubes_scramble.sets = 1;", read(scramble.MODULE_DIR + "/keypad.script"))
+
+    def test_install_names_screens_with_text_digits(self):
+        self.patch(connected_displays=lambda: [("DP-1", 1920, 1080, 0, 0)])
+        output = self.run_command(scramble.cmd_install)
+        self.assertIn(f"{scramble.PROG}: note: DP-1 1920x1080, Plymouth scale 1 shows text digits, not masked digits: it "
+                      "reports no physical size; set ppi in the settings for masked digits", output)
+        keypad = read(scramble.MODULE_DIR + "/keypad.script")
+        self.assertIn("qubes_scramble.sets = 1;\nqubes_scramble.set[0].text = 1;", keypad)
+        self.assertEqual(os.listdir(scramble.MODULE_DIR + "/tiles"), [scramble.TILE_MANIFEST])
 
     def test_install_follows_the_system_layout_and_kernels_with_the_module(self):
         write(scramble.VCONSOLE_CONF, 'KEYMAP="uk"\n')
@@ -1087,9 +1103,26 @@ class MaskedDigitsTest(unittest.TestCase):
         self.assertEqual(scramble.tile_targets(fixed, [("DP-1", 1920, 1080, 0, 0)])[0]["ppi"], 150.0)
         self.assertEqual(scramble.tile_targets(fixed, []),
                          [{"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": 150.0}])
-        for displays in ([], [("DP-1", 1920, 1080, 0, 0)]):
-            with self.assertRaisesRegex(scramble.ScrambleError, "set ppi in the settings"):
-                scramble.tile_targets(config, displays)
+        # without a physical size or ppi the targets have no density (text digits)
+        self.assertEqual(scramble.tile_targets(config, []),
+                         [{"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": None}])
+        self.assertEqual([target["ppi"] for target in scramble.tile_targets(config, [("DP-1", 1920, 1080, 0, 0)])], [None])
+
+    def test_screens_that_cannot_show_masked_digits(self):
+        unavailable = scramble.masked_digits_unavailable
+        config = config_from("[scramble]\ndisplay = hybrid\n")
+        # 27 inch 2560x1440 and 32 inch 3840x2160 screens at the simpledrm guess of scale 2; the first at scale 1
+        target = {"display": "DP-1", "scale": 2, "width": 1280, "height": 720, "ppi": 54.44}
+        self.assertEqual(unavailable(config, target), "size 1 makes 20 px tiles, under 24 px")
+        self.assertEqual(unavailable(config, {**target, "width": 1920, "height": 1080, "ppi": 68.9}),
+                         "camera_floor 1.2 cycles per mm is finer than the screen shows (at most 0.95)")
+        self.assertIsNone(unavailable(config, {**target, "scale": 1, "width": 2560, "height": 1440, "ppi": 108.89}))
+        self.assertEqual(unavailable(config, {**target, "ppi": None}),
+                         "it reports no physical size; set ppi in the settings for masked digits")
+        self.assertEqual(unavailable(config_from("[scramble]\nsize = 0.5\n"), {**target, "ppi": 92.62}),
+                         "size 0.5 makes 16 px tiles, under 24 px")
+        self.assertEqual(unavailable(config_from("[scramble]\nhighpass_cutoff = 3\n"), {**target, "ppi": 141.6}),
+                         "highpass_cutoff 3 cycles per mm is finer than the screen shows (at most 1.95)")
 
     def test_tile_summary_names_the_display_as_reported(self):
         config = config_from("[scramble]\ndisplay = hybrid\nhighpass_cutoff = 0.6\n")
@@ -1118,7 +1151,10 @@ class MaskedDigitsTest(unittest.TestCase):
         files, manifest = scramble.make_tiles(config, [("HDMI-A-1", 1920, 1080, 527, 296)], font)
         tiles = manifest["sets"][0]
         self.assertEqual((len(files), tiles["scale"], tiles["cell"], tiles["cutoff"]),
-                         (100, 1, 32, scramble.CAMERA_FLOOR))
+                         (101, 1, 32, scramble.CAMERA_FLOOR))
+        panel = imaging_image(files[tiles["panel"]["name"]])
+        self.assertEqual((panel.size, panel.getextrema()), (scramble.keypad_row(32, True), ((130, 130),) * 3),
+                         "one opaque panel in the background code, as wide as the digit row and its margins")
         self.assertGreater(tiles["estimated_safety_distance_cm"], 20)
         directory = tempfile.mkdtemp(prefix="scramble-tiles-")
         self.addCleanup(shutil.rmtree, directory)
@@ -1134,17 +1170,50 @@ class MaskedDigitsTest(unittest.TestCase):
         os.unlink(f"{directory}/{name}")
         with self.assertRaisesRegex(scramble.ScrambleError, f"tile {name} is not readable"):
             scramble.check_tiles(directory, manifest_path)
-        files, manifest = scramble.make_tiles(config_from("[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n"),
+        files, manifest = scramble.make_tiles(config_from("[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\npanel = no\n"),
                                               [("HDMI-A-1", 1920, 1080, 527, 296)], font)
-        self.assertEqual((len(files), manifest["sets"][0]["cutoff"], manifest["quantization"]), (10, 1.0, "diffusion"))
+        self.assertEqual((len(files), manifest["sets"][0]["cutoff"], manifest["quantization"], "panel" in manifest["sets"][0]),
+                         (10, 1.0, "diffusion", False))
         quantized = {method: scramble.make_tiles(config_from(f"[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n"
                                                              f"quantization = {method}\n"),
                                                  [("HDMI-A-1", 1920, 1080, 527, 296)], font)[0]
                      for method in ("round", "compensate")}
         self.assertEqual(quantized["round"], quantized["compensate"], "compensation applies at scale 2 only")
         self.assertNotEqual(quantized["round"], files)
-        with self.assertRaisesRegex(scramble.ScrambleError, "camera_floor 1.2 cycles per mm is finer than the screen shows"):
-            scramble.make_tiles(config, [("DP-1", 1920, 1080, 600, 340)], font)
+        # a screen too coarse for the camera floor gets a text set, without tiles
+        manifest = scramble.make_tiles(config, [("DP-1", 1920, 1080, 600, 340)], font)[1]
+        write(manifest_path, json.dumps(manifest))
+        self.assertEqual(scramble.check_tiles(directory, manifest_path)["sets"][0]["text"],
+                         "camera_floor 1.2 cycles per mm is finer than the screen shows (at most 1.12)")
+        self.assertIn("qubes_scramble.set[0].text = 1; qubes_scramble.set[0].width = 1920; "
+                      "qubes_scramble.set[0].height = 1080;", scramble.render_overlay(config, read(TEMPLATE), manifest))
+        self.assertEqual(scramble.tile_summary(manifest), "text digits for DP-1 1920x1080 at 81 ppi, Plymouth scale 1, "
+                         "which cannot show masked digits: camera_floor 1.2 cycles per mm is finer than the screen "
+                         "shows (at most 1.12)")
+
+    def test_size_scales_the_digits_but_not_the_model(self):
+        font = bold_font()
+        if not font:
+            self.skipTest("no bold sans-serif font (fc-match Sans:bold)")
+        display = [("HDMI-A-1", 1920, 1080, 527, 296)]
+        base = scramble.make_tiles(config_from("[scramble]\ndisplay = hybrid\n"), display, font)[1]["sets"][0]
+        config = config_from("[scramble]\ndisplay = hybrid\nsize = 1.5\n")
+        manifest = scramble.make_tiles(config, display, font)[1]
+        tiles = manifest["sets"][0]
+        # the tile grows with the digit; cut-off and estimate stay those of the default size
+        self.assertEqual((tiles["cell"], tiles["cutoff"], tiles["estimated_safety_distance_cm"]),
+                         (scramble.tile_pixels(1.5, tiles["ppi"]), base["cutoff"], base["estimated_safety_distance_cm"]))
+        self.assertEqual((tiles["cell"], tiles["panel"]["width"], tiles["panel"]["height"]), (50, 566, 62))
+        overlay = scramble.render_overlay(config, read(TEMPLATE), manifest)
+        for line in ('qubes_scramble.set[0].panel = "qubes-scramble-tile0-panel.png";',
+                     'qubes_scramble.digit_font = "Sans Bold 30";'):
+            self.assertIn(line, overlay)
+        self.assertIn("quantization diffusion, size 1.5)", scramble.tile_summary(manifest))
+        with self.assertRaisesRegex(scramble.ScrambleError, r"need a digit row of 1266x132 px, the screen leaves 1240x168 px "
+                                                            r"under the key caps; use size 2\.9 or less"):
+            scramble.make_tiles(config_from("[scramble]\nsize = 3\n"), [("eDP-1", 1280, 800, 286, 179)], font)
+        self.assertEqual(scramble.make_tiles(config_from("[scramble]\nsize = 0.5\n"), display, font)[1]["sets"][0]["text"],
+                         "size 0.5 makes 16 px tiles, under 24 px")
 
 
 class FuzzTest(unittest.TestCase):

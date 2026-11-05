@@ -4,15 +4,16 @@
 # hook passes the map of this boot in [script-env-vars] (character n is the digit key n
 # types); without a map nothing changes. Under the password field, each column shows a key,
 # an arrow and the digit the key enters: as text, or as a masked digit image (IllusionPIN
-# high-pass, hybrid or white tiles) from the tile set made for this screen's logical size.
+# high-pass, hybrid or white tiles) from the tile set made for this screen's logical size, on
+# one panel in the tiles' background grey when the set has one. Install draws every image at
+# its final size; nothing is scaled here.
 # Caps Lock switches to standard digits: the map hides and the dot left of the field turns red
 # (GetCapslockState reads the Caps Lock LED). The stock callbacks run first, so the stock
 # prompt is unchanged.
 
 @DIGIT_STYLE@
 @TILE_SETS@
-qubes_scramble.cell = 34;
-qubes_scramble.gap = 6;
+@LAYOUT@
 qubes_scramble.count = 0;
 qubes_scramble.shown = 0;
 qubes_scramble.drawn = -1;
@@ -30,7 +31,7 @@ fun qubes_scramble_add(column, image, dy) {
 }
 
 # The tile set made for this screen's size in Plymouth's logical pixels, else the first one;
-# NULL with text digits
+# NULL with text digits. A text set stands for a screen that cannot show masked digits.
 fun qubes_scramble_tile_set() {
     local.s = global.qubes_scramble;
     local.i;
@@ -55,9 +56,20 @@ fun qubes_scramble_build() {
     local.label;
     local.text;
 
-    # columns as wide as the tiles, but never narrower than the key caps need
+    # a screen that cannot show masked digits shows text digits
+    if (set && set.text)
+        local.set = NULL;
+    # columns as wide as the tiles, but never narrower than the key caps need; with a panel the
+    # digits start a margin below its top edge, which lies 3 px under the arrows
     if (set && set.cell > s.cell)
         s.cell = set.cell;
+    s.row = cap.GetHeight() + 5 + arrow.GetHeight() + 3;
+    if (set && set.panel != "")
+        s.panel.image = Image(set.panel);
+    if (s.panel.image) {
+        s.panel.sprite = Sprite(s.panel.image);
+        s.row = s.row + s.margin;
+    }
     for (column = 0; column < 10; column++) {
         key = (column + 1) % 10;
         digit = qubes_scramble_map.CharAt(key);
@@ -67,16 +79,20 @@ fun qubes_scramble_build() {
             text = Image(set.prefix + key + "-" + digit + ".png");
         else if (set)
             text = Image(set.prefix + digit + ".png");
-        # a tile that does not load (validation makes sure all are there) shows as text
-        if (!text)
-            text = Image.Text(digit, s.red[digit], s.green[digit], s.blue[digit], 1, "Sans Bold 20");
+        # a tile that does not load (validation makes sure all are there) shows as text; a text
+        # digit widens the columns when it does not fit
+        if (!text) {
+            text = Image.Text(digit, s.red[digit], s.green[digit], s.blue[digit], 1, s.digit_font);
+            if (text.GetWidth() + 4 > s.cell)
+                s.cell = text.GetWidth() + 4;
+        }
         qubes_scramble_add(column, cap, 0);
         qubes_scramble_add(column, label, Math.Int((cap.GetHeight() - label.GetHeight()) / 2));
         qubes_scramble_add(column, arrow, cap.GetHeight() + 5);
-        qubes_scramble_add(column, text, cap.GetHeight() + 5 + arrow.GetHeight() + 3);
+        qubes_scramble_add(column, text, s.row);
         if (s.letters[digit] != "")
             qubes_scramble_add(column, Image.Text(s.letters[digit], 0.72, 0.75, 0.8, 1, "Sans 9"),
-                               cap.GetHeight() + 8 + arrow.GetHeight() + text.GetHeight());
+                               s.row + text.GetHeight());
     }
     s.note.image = Image.Text("Caps Lock: standard digits", 0.8, 0.8, 0.8, 1, "Sans 11");
     s.note.sprite = Sprite(s.note.image);
@@ -112,6 +128,8 @@ fun qubes_scramble_layout() {
         item.sprite.SetPosition(left + item.column * (s.cell + s.gap) + Math.Int((s.cell - item.image.GetWidth()) / 2),
                                 top + item.dy, 10);
     }
+    if (s.panel.sprite)
+        s.panel.sprite.SetPosition(left - s.margin, top + s.row - s.margin, 9);
     s.note.sprite.SetPosition(x - 16 - s.note.image.GetWidth(),
                               y + Math.Int((entry.image.GetHeight() - s.note.image.GetHeight()) / 2), 10);
     s.dot.SetPosition(x - 24 - s.note.image.GetWidth() - s.dot_on.GetWidth(),
@@ -129,6 +147,8 @@ fun qubes_scramble_update() {
     s.drawn = s.shown * 2 + scrambled;
     for (i = 0; i < s.count; i++)
         s.item[i].sprite.SetOpacity(s.shown && scrambled);
+    if (s.panel.sprite)
+        s.panel.sprite.SetOpacity(s.shown && scrambled);
     if (scrambled)
         s.dot.SetImage(s.dot_off);
     else

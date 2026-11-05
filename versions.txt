@@ -1,3 +1,18 @@
+Noteworthy changes in release 0.1.3
+
+* Digit size and digit panel
+
+  size scales the digits under the keys; the shipped settings use 1.5,
+  without the line it stays 1. Key caps keep their size. Masked digits lie
+  on one grey panel; panel = no keeps separate tiles. The cut-off and the
+  estimated safety distance are those of size 1.
+
+* Text digits where masked digits cannot be shown
+
+  A screen without a reported size, or too coarse for the digit size or the
+  cut-off (for example a large monitor at Plymouth's simpledrm scale 2), gets
+  text digits instead of stopping the install; install names it.
+
 Noteworthy changes in release 0.1.2
 
 * Masked digits by default

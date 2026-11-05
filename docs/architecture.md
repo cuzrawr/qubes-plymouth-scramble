@@ -19,7 +19,7 @@ In each initramfs the module installs:
 - `qubes-scramble-restore.service`, after `cryptsetup.target`;
 - the overlay, appended to the image's copy of `qubes-dark.script`;
 - `compat/grp_led` of xkeyboard-config, which plymouth-populate-initrd leaves out;
-- for masked digits, the tile PNGs and their manifest.
+- for masked digits, the tile PNGs, the digit panels and their manifest.
 
 ## Boot
 
@@ -88,12 +88,25 @@ After IllusionPIN (Papadopoulos et al., arXiv 1708.06508), with the paper's name
     threshold 0.93), for an onlooker at `safety_distance`, 30 degrees to the side. It picks the
     lowest cut-off that hides the digits, but never below `camera_floor`.
   - A number in `highpass_cutoff`: that cut-off.
-  - Install refuses cut-offs finer than the screen can show.
+  - A screen that cannot show the cut-off gets text digits (see Screens).
 - **Quantization.**
   - `diffusion` (default): Floyd-Steinberg error diffusion in linear light, so the 8-bit
     rounding leaves almost no coarse trace of the digit.
   - `round`: each pixel rounded on its own.
   - `compensate`: rounded, with a correction for Plymouth's scale-2 interpolation.
+- **Size.**
+  - `size` scales the digit and its tile, and the font of text digits; key caps and arrows keep
+    their size. The decoy's low-pass width scales with the digit; the high-pass cut-off stays in
+    cycles per mm.
+  - The cut-off search and the safety estimate run on the size-1 digit. At a fixed cut-off the
+    outline keeps its width while a larger digit grows, so the per-tile MSSIM rises with size
+    although the digit gets easier to read; the tapered filter leaves nothing below the cut-off at
+    any size. How much farther a larger digit can be read near the estimate is not measured.
+  - Tiles under 24 px give text digits (see Screens). Install refuses a keypad the screen cannot
+    fit and names the largest size that fits.
+- **Panel.** With `panel = yes` one opaque PNG in the tiles' background code, made at install at
+  the size of the digit row plus a margin, lies under the tiles, so no gap shows between them. It
+  hides with the map. Install draws every image at its final size; the overlay scales nothing.
 - **Screens.**
   - Install reads the EDID of every connected display and makes a tile set for each scale
     Plymouth may give it, at the logical density.
@@ -101,6 +114,9 @@ After IllusionPIN (Papadopoulos et al., arXiv 1708.06508), with the paper's name
     for 1200 or more lines with 2560 or more columns.
   - The overlay picks the set made for the logical screen size; otherwise the first set, and
     text if a tile does not load.
+  - A screen that cannot show masked digits gets a text set instead: no reported size (and no
+    `ppi`), tiles under 24 px at the configured size, or a cut-off finer than its pixels, as for
+    large monitors at the simpledrm guess. Install names each one; its prompt shows text digits.
   - Plymouth draws the same sprites on every display, so with several screens one set serves
     all of them.
 - **Dependencies.** The tiles are made in dom0 with numpy and Pillow, which every R4.3 dom0 has
