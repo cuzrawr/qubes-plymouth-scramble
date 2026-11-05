@@ -10,8 +10,8 @@ mapping of the keys 0-9, shown under the password field of the stock Plymouth pr
 ```
 
 A camera that sees only the keyboard records keys, not digits. Caps Lock switches to standard
-digits; the dot left of the field turns red while they are active. The digits can also be drawn
-as masked images that fade with distance (IllusionPIN).
+digits; the dot left of the field turns red while they are active. The digits are drawn as
+masked images after IllusionPIN: readable up close, they fade with distance.
 
 Requires Qubes OS 4.3 with an encrypted disk and the stock qubes-dark boot theme. Nothing else
 is installed in dom0.
@@ -47,15 +47,15 @@ sudo qubes-plymouth-scramble status
 ## Configure
 
 The settings are in `/etc/qubes-plymouth-scramble.conf`, each explained there. Apply changes
-with `sudo qubes-plymouth-scramble install`. For example, masked digits:
+with `sudo qubes-plymouth-scramble install`. For example, plain digits instead of masked ones:
 
 ```ini
 [scramble]
 enabled = yes
-display = hybrid
+display = text
 ```
 
-- `display`: `text` (default), `highpass`, `hybrid` or `white`.
+- `display`: `hybrid` (default), `highpass`, `white` or `text`.
 - Masked digits are made for the screens connected at install: run `install` again after
   changing screens.
 - Only the digit keys move: letters and symbols type as before. Caps Lock switches the digits

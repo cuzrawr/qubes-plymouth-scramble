@@ -1,3 +1,11 @@
+Noteworthy changes in release 0.1.2
+
+* Masked digits by default
+
+  display defaults to hybrid, the IllusionPIN keypad; display = text keeps
+  plain digits. Settings that leave display unset switch to hybrid with the
+  next install. Letters or colours in [digits] need display = text.
+
 Noteworthy changes in release 0.1.1
 
 * Only the Plymouth prompt is scrambled

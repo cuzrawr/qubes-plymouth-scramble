@@ -162,7 +162,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((config.enabled, config.letters, config.colors), (True, [""] * 10, [(1.0, 1.0, 1.0)] * 10))
 
     def test_values(self):
-        config = config_from("[scramble]\nenabled = no\n[digits]\n2 = ABC #ff8000\n7 = PQRS\n")
+        config = config_from("[scramble]\nenabled = no\ndisplay = text\n[digits]\n2 = ABC #ff8000\n7 = PQRS\n")
         self.assertFalse(config.enabled)
         self.assertEqual((config.letters[2], config.colors[2], config.letters[7], config.colors[7]),
                          ("ABC", (1.0, 128 / 255, 0.0), "PQRS", (1.0, 1.0, 1.0)))
@@ -184,7 +184,7 @@ class ConfigTest(unittest.TestCase):
         config = config_from("")
         self.assertEqual((config.display, config.highpass_filter, config.safety_distance, config.highpass_cutoff,
                           config.camera_floor, config.lowpass_sigma, config.quantization, config.ppi),
-                         ("text", "tapered", 114.0, None, scramble.CAMERA_FLOOR, scramble.PAPER_SIGMA_LF, "diffusion",
+                         ("hybrid", "tapered", 114.0, None, scramble.CAMERA_FLOOR, scramble.PAPER_SIGMA_LF, "diffusion",
                           None))
         config = config_from("[scramble]\ndisplay = hybrid\nsafety_distance = 152\nhighpass_filter = gaussian\n"
                              "highpass_cutoff = 1.63\ncamera_floor = 0\nlowpass_sigma = 0.3\nquantization = compensate\n"
@@ -274,7 +274,7 @@ class GeneratedFilesTest(unittest.TestCase):
         self.assertEqual(png_alpha(os.path.join(SOURCE, "theme", "qubes-scramble-dot-off.png"))[2](6, 6), 0)
 
     def test_overlay(self):
-        overlay = scramble.render_overlay(config_from("[digits]\n2 = ABC #ff0000\n"), read(TEMPLATE))
+        overlay = scramble.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC #ff0000\n"), read(TEMPLATE))
         self.assertIn(scramble.OVERLAY_MARKER, overlay)
         self.assertIn('qubes_scramble.letters["2"] = "ABC"; qubes_scramble.red["2"] = 1.000; '
                       'qubes_scramble.green["2"] = 0.000;', overlay)
@@ -299,7 +299,7 @@ class GeneratedFilesTest(unittest.TestCase):
 
     def test_module_layout(self):
         with tempfile.TemporaryDirectory() as directory:
-            scramble.write_module(directory, config_from("[digits]\n2 = ABC\n"), "us")
+            scramble.write_module(directory, config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"), "us")
             for name in ("module-setup.sh", "qubes-plymouth-scramble.conf", "keypad.script", "source/README.md",
                          "source/qubes-plymouth-scramble.conf", "source/theme/keypad.script.in"):
                 self.assertTrue(os.path.isfile(os.path.join(directory, name)), name)
@@ -507,7 +507,8 @@ class ValidateTreeTest(unittest.TestCase):
             write(f"{self.root}{scramble.THEME_DIR}/{name}", data)
         write(f"{self.root}{scramble.THEME_DIR}/{scramble.TILE_MANIFEST}", json.dumps(manifest))
         scramble.validate_tree(self.root)
-        text_overlay = scramble.render_overlay(config_from("[digits]\n2 = ABC\n"), read(TEMPLATE), manifest)
+        text_overlay = scramble.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"),
+                                               read(TEMPLATE), manifest)
         for broken, message in ((overlay.replace("sets = 1;", "sets = 2;"), "list different tile sets"),
                                 (text_overlay, "show letters"), (overlay.replace("qubes_scramble.sets = 1;", ""),
                                                                  "declares no tile sets")):
@@ -626,7 +627,8 @@ class InstallFlowTest(FlowTestCase):
             if self.failing:
                 raise scramble.ScrambleError("image validation failed")
 
-        self.patch(build_and_switch=build, check_theme=lambda: None, hooked_kernels=lambda: list(self.hooked))
+        self.patch(build_and_switch=build, check_theme=lambda: None, hooked_kernels=lambda: list(self.hooked),
+                   connected_displays=lambda: [("HDMI-A-1", 1920, 1080, 527, 296)], system_font=bold_font)
 
     def run_command(self, command, config_text=None):
         path = None
@@ -650,14 +652,13 @@ class InstallFlowTest(FlowTestCase):
         self.assertEqual(read(scramble.CONFIG_FILE), read(os.path.join(SOURCE, "qubes-plymouth-scramble.conf")))
         self.assertEqual(os.readlink(scramble.INSTALLED_CLI), scramble.MODULE_DIR + "/source/" + scramble.PROG)
         for text in (f"add      {scramble.MODULE_DIR}", f"add      {scramble.CONFIG_FILE}", "keyboard layout us",
-                     f"rebuild  {self.image(self.running)}"):
+                     f"rebuild  {self.image(self.running)}", "hybrid digit tiles"):
             self.assertIn(text, output)
         self.assertEqual(os.listdir(self.top + "/modules.d"), ["91qubes-scramble"], "no staging leftovers")
 
     @unittest.skipUnless(importlib.util.find_spec("numpy") and importlib.util.find_spec("PIL") and bold_font(),
                          "masked digits need numpy, Pillow and a bold sans-serif font")
     def test_masked_install_writes_tiles(self):
-        self.patch(connected_displays=lambda: [("HDMI-A-1", 1920, 1080, 527, 296)], system_font=bold_font)
         output = self.run_command(scramble.cmd_install, "[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n")
         with open(f"{scramble.MODULE_DIR}/tiles/{scramble.TILE_MANIFEST}", encoding="ascii") as stream:
             manifest = json.load(stream)
@@ -683,7 +684,7 @@ class InstallFlowTest(FlowTestCase):
         self.run_command(scramble.cmd_install)
         installed, self.failing = self.state(), True
         with self.assertRaises(scramble.ScrambleError):
-            self.run_command(scramble.cmd_install, "[digits]\n2 = ABC\n")
+            self.run_command(scramble.cmd_install, "[scramble]\ndisplay = text\n[digits]\n2 = ABC\n")
         self.assertEqual(self.state(), installed, "the previous installation is restored")
 
     def test_unknown_setting_stops_install_before_any_change(self):
@@ -719,6 +720,19 @@ class InstallFlowTest(FlowTestCase):
         self.assertIn(f"remove   {scramble.CONFIG_FILE}", output)
         self.hooked = []
         self.assertIn("nothing to change", self.run_command(scramble.cmd_uninstall))
+
+    def test_reinstalls_with_changed_settings_then_uninstall_leave_the_stock_state(self):
+        stock = self.state()
+        self.run_command(scramble.cmd_install)
+        self.hooked = [self.running]
+        for settings in ("[scramble]\ndisplay = text\n", "[scramble]\ndisplay = white\nhighpass_cutoff = 1\n",
+                         "[scramble]\nenabled = no\n", "[scramble]\ndisplay = hybrid\n"):
+            write(scramble.CONFIG_FILE, settings)
+            self.run_command(scramble.cmd_install)
+        self.run_command(scramble.cmd_uninstall)
+        self.assertEqual(self.state(), stock)
+        self.assertEqual(self.builds[-1], ([self.running], False))
+        self.assertEqual(os.listdir(self.top + "/modules.d"), [], "no module, staging or previous copies left")
 
     def test_status(self):
         self.patch(image_has_hook=lambda image: True)

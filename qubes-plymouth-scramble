@@ -137,7 +137,7 @@ class Config:
                    f"({unit})")
             return value
 
-        self.display = scramble.get("display", "text")
+        self.display = scramble.get("display", "hybrid")
         expect(self.display in ("text", *MASK_MODES), f"{path}: display = {self.display}: expected text, "
                f"{', '.join(MASK_MODES)}")
         self.highpass_filter = scramble.get("highpass_filter", "tapered")
