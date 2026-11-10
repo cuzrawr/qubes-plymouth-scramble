@@ -5,6 +5,7 @@ dom0 or Fedora). The fuzz tests use fixed seeds, so every run checks the same in
 """
 
 import contextlib
+import copy
 import glob
 import importlib.machinery
 import importlib.util
@@ -12,25 +13,33 @@ import io
 import json
 import math
 import os
+import pathlib
 import random
 import re
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
+import sys
+import tarfile
 import tempfile
 import unittest
 import zlib
 from unittest import mock
 
 SOURCE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-_loader = importlib.machinery.SourceFileLoader("scramble", os.path.join(SOURCE, "qubes-plymouth-scramble"))
-scramble = importlib.util.module_from_spec(importlib.util.spec_from_loader("scramble", _loader))
-_loader.exec_module(scramble)
+_loader = importlib.machinery.SourceFileLoader("theme", os.path.join(SOURCE, "qubes-plymouth-scramble-theme"))
+_spec = importlib.util.spec_from_loader("theme", _loader)
+assert _spec is not None
+theme = importlib.util.module_from_spec(_spec)
+sys.modules["theme"] = theme
+_loader.exec_module(theme)
+scramble = theme.base
 
 HOOK = os.path.join(SOURCE, "dracut", "qubes-scramble.sh")
 TEMPLATE = os.path.join(SOURCE, "theme", "keypad.script.in")
-# Digit tiles as install makes them for a 160 ppi screen (the tool's TILE_MM, DIGIT_MM and BUTTON_SHARE)
+# Digit tiles as the builder makes them for a 160 ppi screen (the tool's TILE_MM, DIGIT_MM and BUTTON_SHARE)
 PPI, TILE_PX, GLYPH_PX, BUTTON_PX = 160, 56, 35, 45
 STOCK_THEME = "[Plymouth Theme]\nName=Qubes Dark\nModuleName=script\n\n[script]\nImageDir=/x\nScriptFile=/x/s\n"
 # The parts of the qubes-dark theme script (qubes-artwork-plymouth 4.3.9) the keypad overlay uses
@@ -102,11 +111,28 @@ def read_bytes(path):
         return stream.read()
 
 
-def config_from(text):
+def write_tar(path, files, extras=()):
+    """A complete theme archive, optionally with hostile or malformed additional members."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tarfile.open(path, "w") as archive:
+        for name, data in files.items():
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(data), 0o644
+            archive.addfile(member, io.BytesIO(data))
+        for member, data in extras:
+            archive.addfile(member, io.BytesIO(data))
+
+
+def config_from(text, *, screens=True):
+    """Settings with a generic screen unless a parser test explicitly omits it."""
+    if screens and isinstance(text, str):
+        screen = "screens = HDMI-A-1 1920x1080 527x296mm\n"
+        text = (text.replace("[scramble]", "[scramble]\n" + screen, 1) if "[scramble]" in text
+                else text + "\n[scramble]\n" + screen)
     with tempfile.NamedTemporaryFile(suffix=".conf", delete=False) as stream:
         stream.write(text.encode("utf-8", "surrogatepass") if isinstance(text, str) else text)
     try:
-        return scramble.Config(stream.name)
+        return theme.Config(stream.name)
     finally:
         os.unlink(stream.name)
 
@@ -126,7 +152,7 @@ def write_image_conf(root, layout="us"):
 
 def imaging_image(data):
     """A PNG from bytes as a Pillow image."""
-    return scramble.imaging()[1].Image.open(io.BytesIO(data))
+    return theme.imaging()[1].Image.open(io.BytesIO(data))
 
 
 def bold_font():
@@ -139,20 +165,6 @@ def bold_font():
     return path if os.path.isfile(path) else None
 
 
-def synthetic_edid(width, height, width_mm, height_mm, *, width_cm=0, height_cm=0):
-    """An EDID base block with one detailed timing for the mode and image size given."""
-    data = bytearray(128)
-    data[:8] = b"\x00\xff\xff\xff\xff\xff\xff\x00"
-    data[21], data[22] = width_cm, height_cm
-    timing = bytearray(18)
-    timing[0], timing[1] = 0x01, 0x1D  # pixel clock, any non-zero value
-    timing[2], timing[4] = width & 0xFF, (width >> 4) & 0xF0
-    timing[5], timing[7] = height & 0xFF, (height >> 4) & 0xF0
-    timing[12], timing[13] = width_mm & 0xFF, height_mm & 0xFF
-    timing[14] = ((width_mm >> 4) & 0xF0) | ((height_mm >> 8) & 0x0F)
-    data[54:72] = timing
-    data[127] = -sum(data[:127]) % 256
-    return bytes(data)
 
 
 def run_hook(root, *args):
@@ -164,11 +176,10 @@ def run_hook(root, *args):
 class ConfigTest(unittest.TestCase):
     def test_defaults(self):
         config = config_from("")
-        self.assertEqual((config.enabled, config.letters, config.colors), (True, [""] * 10, [(1.0, 1.0, 1.0)] * 10))
+        self.assertEqual((config.decoy_amplitude, config.letters, config.colors), (0.3, [""] * 10, [(1.0, 1.0, 1.0)] * 10))
 
     def test_values(self):
-        config = config_from("[scramble]\nenabled = no\ndisplay = text\n[digits]\n2 = ABC #ff8000\n7 = PQRS\n")
-        self.assertFalse(config.enabled)
+        config = config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC #ff8000\n7 = PQRS\n")
         self.assertEqual((config.letters[2], config.colors[2], config.letters[7], config.colors[7]),
                          ("ABC", (1.0, 128 / 255, 0.0), "PQRS", (1.0, 1.0, 1.0)))
 
@@ -181,15 +192,38 @@ class ConfigTest(unittest.TestCase):
 
     def test_unknown_settings_are_named_with_the_valid_ones(self):
         with self.assertRaisesRegex(scramble.ScrambleError, r"unknown sections or settings: console, layout \(valid are "
-                                                            r"enabled, display, safety_distance, .*, ppi in \[scramble\] "
+                                                            r"display, .*, ppi in \[scramble\] "
                                                             r"and the digits 0-9 in \[digits\]\)"):
-            config_from("[scramble]\nenabled = yes\nconsole = no\nlayout = us\n")
+            config_from("[scramble]\nconsole = no\nlayout = us\n")
+
+    def test_legacy_settings_name_the_replacement(self):
+        for setting, replacement in (("enabled = yes", "apply or remove"),
+                                      ("display = highpass", "decoy_amplitude = 0")):
+            with self.subTest(setting=setting), self.assertRaisesRegex(scramble.ScrambleError, replacement):
+                config_from(f"[scramble]\n{setting}\n")
+
+    def test_screens_and_output(self):
+        screen = ("eDP-1", 1920, 1080, 300, 170)
+        for value in ("eDP-1 1920x1080 300x170mm",
+                      "eDP-1 connected primary 1920x1080+0+0 (normal left inverted right x axis y axis) 300mm x 170mm"):
+            with self.subTest(value=value):
+                self.assertEqual(theme.parse_screens(value), [screen])
+        self.assertEqual(theme.parse_screens("1920x1080 300x170mm")[0][1:], screen[1:])
+        self.assertEqual(len(theme.parse_screens("DP-1 1920x1080 300x170mm\nDP-2 2560x1440 600x340mm")), 2)
+        for value in ("garbage", "DP-1 disconnected", "0x1080 300x170mm", "1920x1080 -1x170mm"):
+            with self.subTest(value=value), self.assertRaises(scramble.ScrambleError):
+                theme.parse_screens(value)
+        with self.assertRaisesRegex(scramble.ScrambleError, "screens"):
+            config_from("", screens=False)
+        self.assertEqual(config_from("[scramble]\ndisplay = text\n", screens=False).screens, [])
+        config = config_from("[scramble]\noutput = ~/generated-theme\n")
+        self.assertEqual(config.output, os.path.expanduser("~/generated-theme"))
 
     def test_masked_digit_settings(self):
         config = config_from("")
         self.assertEqual((config.display, config.highpass_filter, config.safety_distance, config.highpass_cutoff,
                           config.camera_floor, config.lowpass_sigma, config.quantization, config.ppi),
-                         ("hybrid", "tapered", 114.0, None, scramble.CAMERA_FLOOR, scramble.PAPER_SIGMA_LF, "diffusion",
+                         ("hybrid", "tapered", 114.0, None, theme.CAMERA_FLOOR, theme.PAPER_SIGMA_LF, "diffusion",
                           None))
         config = config_from("[scramble]\ndisplay = hybrid\nsafety_distance = 152\nhighpass_filter = gaussian\n"
                              "highpass_cutoff = 1.63\ncamera_floor = 0\nlowpass_sigma = 0.3\nquantization = compensate\n"
@@ -198,13 +232,15 @@ class ConfigTest(unittest.TestCase):
                           config.camera_floor, config.lowpass_sigma, config.quantization, config.ppi),
                          ("hybrid", "gaussian", 152.0, 1.63, 0.0, 0.3, "compensate", 157.0))
         self.assertIsNone(config_from("[scramble]\nhighpass_cutoff = auto\n").highpass_cutoff)
-        for text, message in (("display = hybrid2", "display = hybrid2: expected text, highpass, hybrid, white"),
+        for text, message in (("display = hybrid2", "display = hybrid2: expected text, hybrid, white"),
                               ("highpass_filter = sinc", "expected tapered or gaussian"),
                               ("quantization = dither", "quantization = dither: expected diffusion, round, compensate"),
                               ("safety_distance = 5", "safety_distance = 5: expected a number from 20 to 1000 [(]cm[)]"),
                               ("safety_distance = far", "safety_distance = far: expected a number"),
                               ("highpass_cutoff = 0", "highpass_cutoff = 0: expected a number from 0.1 to 10"),
                               ("camera_floor = -1", "camera_floor = -1: expected a number from 0 to 10"),
+                              ("decoy_amplitude = nan", "decoy_amplitude = nan: expected a number"),
+                              ("decoy_amplitude = 0.7", "decoy_amplitude = 0.7: expected a number"),
                               ("ppi = nan", "ppi = nan: expected a number from 50 to 1000"),
                               ("size = 4", "size = 4: expected a number from 0.5 to 3"),
                               ("panel = maybe", "cannot read configuration")):
@@ -212,6 +248,8 @@ class ConfigTest(unittest.TestCase):
                 config_from(f"[scramble]\n{text}\n")
         with self.assertRaisesRegex(scramble.ScrambleError, "display = white draws the digits as images without letters"):
             config_from("[scramble]\ndisplay = white\n[digits]\n2 = ABC\n")
+        with self.assertRaisesRegex(scramble.ScrambleError, "display = hybrid draws the digits as images"):
+            config_from("[scramble]\ndecoy_amplitude = 0\n[digits]\n2 = ABC\n")
         self.assertEqual(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n").letters[2], "ABC")
 
 
@@ -281,7 +319,7 @@ class GeneratedFilesTest(unittest.TestCase):
         self.assertEqual(png_alpha(os.path.join(SOURCE, "theme", "qubes-scramble-dot-off.png"))[2](6, 6), 0)
 
     def test_overlay(self):
-        overlay = scramble.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC #ff0000\n"), read(TEMPLATE))
+        overlay = theme.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC #ff0000\n"), read(TEMPLATE))
         self.assertIn(scramble.OVERLAY_MARKER, overlay)
         self.assertIn('qubes_scramble.letters["2"] = "ABC"; qubes_scramble.red["2"] = 1.000; '
                       'qubes_scramble.green["2"] = 0.000;', overlay)
@@ -292,12 +330,12 @@ class GeneratedFilesTest(unittest.TestCase):
             self.assertIn(f"keyboard_input_callback({sequence})", overlay)
 
     def test_overlay_with_tile_sets(self):
-        text = scramble.render_overlay(config_from(""), read(TEMPLATE))
+        text = theme.render_overlay(config_from(""), read(TEMPLATE))
         self.assertIn("qubes_scramble.sets = 0;", text)
         manifest = {"display": "hybrid", "sets": [
             {"prefix": "qubes-scramble-tile0-", "cell": 56, "width": 1920, "height": 1080},
             {"prefix": "qubes-scramble-tile1-", "cell": 40, "width": 960, "height": 600}]}
-        text = scramble.render_overlay(config_from("[scramble]\ndisplay = hybrid\n"), read(TEMPLATE), manifest)
+        text = theme.render_overlay(config_from("[scramble]\ndisplay = hybrid\n"), read(TEMPLATE), manifest)
         self.assertIn("qubes_scramble.sets = 2;", text)
         self.assertIn('qubes_scramble.set[1].prefix = "qubes-scramble-tile1-"; qubes_scramble.set[1].keyed = 1; '
                       "qubes_scramble.set[1].cell = 40; qubes_scramble.set[1].width = 960; "
@@ -305,23 +343,25 @@ class GeneratedFilesTest(unittest.TestCase):
         self.assertNotIn("@", text)
 
     def test_module_layout(self):
-        with tempfile.TemporaryDirectory() as directory:
-            scramble.write_module(directory, config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"), "us")
-            for name in ("module-setup.sh", "qubes-plymouth-scramble.conf", "keypad.script", "source/README.md",
-                         "source/qubes-plymouth-scramble.conf", "source/theme/keypad.script.in"):
-                self.assertTrue(os.path.isfile(os.path.join(directory, name)), name)
-            self.assertTrue(os.access(os.path.join(directory, "source", scramble.PROG), os.X_OK))
-            self.assertIn('letters["2"] = "ABC"', read(os.path.join(directory, "keypad.script")))
-            module_setup = read(os.path.join(directory, "module-setup.sh"))
-            self.assertEqual(module_setup, read(os.path.join(SOURCE, "dracut", "module-setup.sh")))
-            referenced = re.findall(r'"\$src/([^" ]+)"', module_setup) + re.findall(r'"\$src"/([^ ;]+)', module_setup)
-            self.assertGreaterEqual(len(referenced), 5)
-            for pattern in referenced:
-                self.assertTrue(glob.glob(os.path.join(directory, "source", pattern)), pattern)
-        with tempfile.TemporaryDirectory() as directory:
-            scramble.write_module(directory, config_from("[scramble]\nenabled = no\n"), "")
-            self.assertEqual(sorted(os.listdir(directory)), ["module-setup.sh", "source"], "disabled: dracut skips it")
-            self.assertTrue(os.access(os.path.join(directory, "source", scramble.PROG), os.X_OK))
+        module_setup = read(os.path.join(SOURCE, "dracut", "module-setup.sh"))
+        referenced = re.findall(r'"\$moddir/([^" ]+)"', module_setup)
+        self.assertGreaterEqual(len(referenced), 3)
+        for name in referenced:
+            self.assertTrue(os.path.isfile(os.path.join(SOURCE, "dracut", name)), name)
+        files, manifest = theme.build_theme(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"))
+        self.assertIsNone(manifest)
+        self.assertEqual(set(files), {"keypad.script", *scramble.IMAGES})
+        self.assertIn(b'letters["2"] = "ABC"', files["keypad.script"])
+        self.assertNotIn("$src", module_setup, "the installed module must not depend on a builder source tree")
+
+    def test_one_version_in_the_spec_the_readme_commands_and_the_release_notes(self):
+        spec = read(os.path.join(SOURCE, "rpm", "qubes-plymouth-scramble.spec"))
+        version, release = (re.search(rf"^{tag}:\s*(\S+)$", spec, re.MULTILINE)[1] for tag in ("Version", "Release"))
+        named = re.findall(r"qubes-plymouth-scramble-([0-9]+(?:\.[0-9]+)+)(?:-([0-9]+)\.noarch)?",
+                           read(os.path.join(SOURCE, "README.md")))
+        self.assertEqual(set(named), {(version, ""), (version, release)})
+        self.assertTrue(read(os.path.join(SOURCE, "versions.txt")).startswith(f"Noteworthy changes in release {version}\n"))
+        self.assertRegex(spec, rf"(?m)^\* .* - {re.escape(version)}-{re.escape(release)}$")
 
     def test_module_conf(self):
         """The settings the boot hook and module-setup.sh source give exactly these values in bash."""
@@ -490,7 +530,7 @@ class ValidateTreeTest(unittest.TestCase):
         write_image_conf(self.root)
         write(self.root + "/etc/vconsole.conf", STOCK_VCONSOLE)
         write(self.root + scramble.THEME_FILE, STOCK_THEME)
-        write(self.root + scramble.THEME_SCRIPT, STOCK_SCRIPT + scramble.render_overlay(config_from(""), read(TEMPLATE)))
+        write(self.root + scramble.THEME_SCRIPT, STOCK_SCRIPT + theme.render_overlay(config_from(""), read(TEMPLATE)))
         write(self.root + scramble.IMAGE_HOOK, read(HOOK))
         for wants, unit in ((scramble.IMAGE_WANTS, "qubes-scramble.service"),
                             (scramble.IMAGE_RESTORE_WANTS, "qubes-scramble-restore.service")):
@@ -506,15 +546,20 @@ class ValidateTreeTest(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("numpy") and importlib.util.find_spec("PIL") and bold_font(),
                          "masked digits need numpy, Pillow and a bold sans-serif font")
     def test_masked_tree(self):
-        config = config_from("[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n")
-        files, manifest = scramble.make_tiles(config, [("HDMI-A-1", 1920, 1080, 527, 296)], bold_font())
-        overlay = scramble.render_overlay(config, read(TEMPLATE), manifest)
-        write(self.root + scramble.THEME_SCRIPT, STOCK_SCRIPT + overlay)
-        for name, data in files.items():
-            write(f"{self.root}{scramble.THEME_DIR}/{name}", data)
-        write(f"{self.root}{scramble.THEME_DIR}/{scramble.TILE_MANIFEST}", json.dumps(manifest))
+        config = config_from("[scramble]\ndisplay = hybrid\ndecoy_amplitude = 0\nhighpass_cutoff = 1\n")
+        files, manifest = theme.build_theme(config)
+        with tempfile.TemporaryDirectory() as directory:
+            archive = directory + "/theme.tar"
+            extracted = directory + "/imported"
+            os.mkdir(extracted)
+            write_tar(archive, files)
+            self.assertEqual(scramble.import_theme(archive, extracted), manifest)
+            overlay = read(extracted + "/keypad.script")
+            write(self.root + scramble.THEME_SCRIPT, STOCK_SCRIPT + overlay)
+            for name in files.keys() - {"keypad.script"}:
+                shutil.copyfile(f"{extracted}/{name}", f"{self.root}{scramble.THEME_DIR}/{name}")
         scramble.validate_tree(self.root)
-        text_overlay = scramble.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"),
+        text_overlay = theme.render_overlay(config_from("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"),
                                                read(TEMPLATE), manifest)
         for broken, message in ((overlay.replace("sets = 1;", "sets = 2;"), "list different tile sets"),
                                 (text_overlay, "show letters"), (overlay.replace("qubes_scramble.sets = 1;", ""),
@@ -560,7 +605,7 @@ class ValidateTreeTest(unittest.TestCase):
 
 
 class ConfirmTest(unittest.TestCase):
-    """The change list and question before install and uninstall change anything."""
+    """The change list and question before apply and remove change anything."""
 
     CHANGES = (("add", "/etc/x.conf", "copy of y"), ("rebuild", "/boot/initramfs-k.img", ""))
 
@@ -569,7 +614,7 @@ class ConfirmTest(unittest.TestCase):
         reply = {"side_effect": answer} if isinstance(answer, type) else {"return_value": answer}
         with mock.patch("sys.stdin", mock.Mock(isatty=lambda: tty)), mock.patch("builtins.input", **reply), \
                 contextlib.redirect_stdout(output):
-            return scramble.confirm("install", self.CHANGES, assume_yes), output.getvalue()
+            return scramble.confirm("apply", self.CHANGES, assume_yes), output.getvalue()
 
     def test_lists_changes_and_accepts_yes(self):
         for answer in ("y", " YES "):
@@ -589,12 +634,146 @@ class ConfirmTest(unittest.TestCase):
     def test_yes_option_and_no_changes(self):
         self.assertTrue(self.ask("n", tty=False, assume_yes=True)[0])
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            self.assertFalse(scramble.confirm("uninstall", [], False))
+            self.assertFalse(scramble.confirm("remove", [], False))
         self.assertIn("nothing to change", output.getvalue())
 
 
+class ImportThemeTest(unittest.TestCase):
+    """A transfer qube controls archive metadata and bytes; only a complete theme may be applied."""
+
+    def setUp(self):
+        self.top = tempfile.mkdtemp(prefix="scramble-import-")
+        self.addCleanup(shutil.rmtree, self.top)
+        self.files = theme.build_theme(config_from("[scramble]\ndisplay = text\n"))[0]
+
+    def import_files(self, files=None, extras=()):
+        path = self.top + "/input.tar"
+        write_tar(path, self.files if files is None else files, extras)
+        directory = tempfile.mkdtemp(dir=self.top)
+        return directory, scramble.import_theme(path, directory)
+
+    def test_complete_text_theme_round_trip(self):
+        directory, manifest = self.import_files()
+        self.assertIsNone(manifest)
+        self.assertEqual({name: read_bytes(os.path.join(directory, name)) for name in os.listdir(directory)}, self.files)
+        target = tempfile.mkdtemp(dir=self.top)
+        self.assertIsNone(scramble.import_theme(read_bytes(self.top + "/input.tar"), target))
+        self.assertEqual(read_bytes(target + "/keypad.script"), self.files["keypad.script"])
+
+    def test_unsafe_members_are_refused(self):
+        members = [("../escape", tarfile.REGTYPE), ("/escape", tarfile.REGTYPE),
+                   ("unknown", tarfile.REGTYPE), ("keypad.script", tarfile.REGTYPE),
+                   ("qubes-scramble-tile0-0.png", tarfile.SYMTYPE),
+                   ("qubes-scramble-tile0-0.png", tarfile.LNKTYPE),
+                   ("qubes-scramble-tile0-0.png", tarfile.DIRTYPE),
+                   ("qubes-scramble-tile0-0.png", tarfile.FIFOTYPE)]
+        for name, kind in members:
+            member = tarfile.TarInfo(name)
+            member.type, member.linkname = kind, "../escape" if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE) else ""
+            with self.subTest(name=name, kind=kind), self.assertRaises(scramble.ScrambleError):
+                self.import_files(extras=[(member, b"")])
+        self.assertFalse(os.path.lexists(self.top + "/escape"))
+
+    def test_incomplete_and_unreadable_themes_are_refused(self):
+        for missing in ("keypad.script", scramble.IMAGES[0]):
+            with self.subTest(missing=missing), self.assertRaises(scramble.ScrambleError):
+                self.import_files({name: data for name, data in self.files.items() if name != missing})
+        with self.assertRaises(scramble.ScrambleError):
+            self.import_files({**self.files, "keypad.script": b"not an overlay"})
+        for data in (b"", b"not a tar archive", b"x" * 512):
+            with self.subTest(data=data[:10]), self.assertRaises(scramble.ScrambleError):
+                scramble.import_theme(data, tempfile.mkdtemp(dir=self.top))
+
+    def test_archive_limits_are_enforced(self):
+        with mock.patch.object(scramble, "THEME_MAX_FILES", len(self.files) - 1), self.assertRaises(scramble.ScrambleError):
+            self.import_files()
+        with mock.patch.object(scramble, "THEME_MAX_BYTES", 32768), self.assertRaises(scramble.ScrambleError):
+            self.import_files({**self.files, "qubes-scramble-tile0-0.png": b"x" * 32769})
+
+    def test_malformed_manifest_is_a_clean_import_error(self):
+        overlay = self.files["keypad.script"].replace(b"sets = 0;", b"sets = 1;")
+        for manifest in (b"not json", b"null", b"[]", b"{}", b'{"version":1,"display":"hybrid","sets":[null]}'):
+            with self.subTest(manifest=manifest), self.assertRaises(scramble.ScrambleError):
+                self.import_files({**self.files, "keypad.script": overlay, scramble.TILE_MANIFEST: manifest})
+
+    def test_recursive_archive_and_manifest_are_clean_import_errors(self):
+        header = tarfile.TarInfo("extended-header")
+        header.type, header.size = tarfile.GNUTYPE_LONGNAME, 1
+        block = header.tobuf(format=tarfile.GNU_FORMAT) + b"x" + b"\0" * 511
+        with self.assertRaisesRegex(scramble.ScrambleError, "cannot unpack theme archive"):
+            scramble.import_theme(block * sys.getrecursionlimit() + b"\0" * 1024, tempfile.mkdtemp(dir=self.top))
+        overlay = self.files["keypad.script"].replace(b"sets = 0;", b"sets = 1;")
+        manifest = b"[" * 100000 + b"0" + b"]" * 100000
+        with self.assertRaisesRegex(scramble.ScrambleError, "cannot read the tile manifest"):
+            self.import_files({**self.files, "keypad.script": overlay, scramble.TILE_MANIFEST: manifest})
+
+
+@unittest.skipUnless(importlib.util.find_spec("PIL"), "previews need Pillow")
+class BuilderFlowTest(unittest.TestCase):
+    def setUp(self):
+        self.top = tempfile.mkdtemp(prefix="scramble-builder-")
+        self.addCleanup(shutil.rmtree, self.top)
+
+    def test_first_run_creates_settings_without_a_theme(self):
+        path = self.top + "/config/qubes-plymouth-scramble.conf"
+        with mock.patch.object(theme, "CONFIG_FILE", path), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(theme.main([]), 0)
+        self.assertEqual(read_bytes(path), read_bytes(os.path.join(SOURCE, "qubes-plymouth-scramble.conf")))
+        self.assertIn("screens", output.getvalue())
+        self.assertEqual(os.listdir(self.top), ["config"])
+
+    def test_builder_writes_a_complete_archive_and_can_replace_it(self):
+        config = config_from("[scramble]\ndisplay = text\n")
+        config.output = self.top + "/output"
+        for letters in ("", "ABC"):
+            config.letters[2] = letters
+            with contextlib.redirect_stdout(io.StringIO()):
+                path = theme.write_theme(config)
+            destination = tempfile.mkdtemp(dir=self.top)
+            self.assertIsNone(scramble.import_theme(path, destination))
+            self.assertIn(f'letters["2"] = "{letters}"', read(destination + "/keypad.script"))
+            with tarfile.open(path) as archive:
+                self.assertTrue(all(member.isfile() and member.uid == member.gid == 0 for member in archive))
+        self.assertEqual(os.listdir(config.output), ["qubes-plymouth-scramble-theme.tar"])
+
+    def test_transfer_commands_survive_both_shells(self):
+        path = pathlib.Path(self.top, "it's here", "theme one.tar")
+        for name, expected in (("builder-1\n", "builder-1"), ("$(reboot)\n", "BUILDER_QUBE")):
+            with self.subTest(name=name), mock.patch("subprocess.run", return_value=mock.Mock(stdout=name)):
+                fetch, apply = theme.transfer_commands(path)
+            words = shlex.split(fetch)
+            self.assertEqual((words[:3], words[4:]), (["qvm-run", "--pass-io", expected], [">", "theme one.tar"]))
+            self.assertEqual(shlex.split(words[3]), ["cat", "--", str(path)])
+            self.assertEqual(shlex.split(apply), ["sudo", "qubes-plymouth-scramble", "apply", "theme one.tar"])
+
+    def test_preview_is_shown_or_else_saved(self):
+        image = theme.imaging()[1].Image.new("RGB", (8, 6), (10, 20, 30))
+
+        def show(display, viewer_status, output):
+            with mock.patch.dict(os.environ, {"DISPLAY": display, "WAYLAND_DISPLAY": ""}), \
+                    mock.patch("shutil.which", return_value="/usr/bin/xdg-open"), \
+                    mock.patch("subprocess.run", return_value=mock.Mock(returncode=viewer_status)) as viewer, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                return theme.show_or_save(image, output), viewer
+
+        for display in ("", ":1"):  # no display, then a viewer that fails
+            path, viewer = show(display, 1, self.top + "/saved")
+            self.assertRegex(os.path.basename(path), r"^preview-[0-9]{8}T[0-9]{12}Z\.png$")
+            with imaging_image(read_bytes(path)) as saved:
+                self.assertEqual((saved.size, saved.tobytes()), (image.size, image.tobytes()))
+            for call in viewer.call_args_list:
+                self.assertFalse(os.path.exists(call.args[0][1]), "the temporary file of a failed viewer is removed")
+        path, viewer = show(":1", 0, self.top + "/shown")
+        shown = viewer.call_args.args[0][1]
+        self.addCleanup(os.unlink, shown)
+        self.assertIsNone(path)
+        with imaging_image(read_bytes(shown)) as opened:
+            self.assertEqual(opened.tobytes(), image.tobytes())
+        self.assertFalse(os.path.exists(self.top + "/shown"), "a shown preview is not saved in the output directory")
+
+
 class FlowTestCase(unittest.TestCase):
-    """A temporary root for the paths install and uninstall change."""
+    """A temporary root for state and initramfs changes; packaged files stay fixed."""
 
     def setUp(self):
         self.top = tempfile.mkdtemp(prefix="scramble-flow-")
@@ -602,11 +781,11 @@ class FlowTestCase(unittest.TestCase):
         self.running = os.uname().release
         write(self.image(self.running), "stock image")
         write(self.top + "/etc/vconsole.conf", STOCK_VCONSOLE)
-        for directory in ("/modules.d", "/sbin", "/lib/modules/" + self.running):
+        for directory in ("/modules.d/91qubes-scramble", "/state", "/lib/modules/" + self.running):
             os.makedirs(self.top + directory)
-        self.patch(MODULE_DIR=self.top + "/modules.d/91qubes-scramble", CONFIG_FILE=self.top + "/etc/scramble.conf",
-                   VCONSOLE_CONF=self.top + "/etc/vconsole.conf", INSTALLED_CLI=self.top + "/sbin/qubes-plymouth-scramble",
-                   KERNEL_MODULES=self.top + "/lib/modules", boot_image=self.image)
+        self.patch(MODULE_DIR=self.top + "/modules.d/91qubes-scramble", THEME_STATE=self.top + "/state/theme",
+                   VCONSOLE_CONF=self.top + "/etc/vconsole.conf", KERNEL_MODULES=self.top + "/lib/modules", boot_image=self.image)
+        write(scramble.MODULE_DIR + "/module-setup.sh", "packaged dracut module\n")
         sync = mock.patch("os.sync")
         sync.start()
         self.addCleanup(sync.stop)
@@ -621,9 +800,8 @@ class FlowTestCase(unittest.TestCase):
         return f"{self.top}/boot/initramfs-{kernel}.img"
 
 
-class InstallFlowTest(FlowTestCase):
-    """install and uninstall with the image builds recorded: the module, the settings file and
-    the link change together or not at all."""
+class ApplyFlowTest(FlowTestCase):
+    """Theme changes roll back when a build fails and never rewrite packaged files."""
 
     def setUp(self):
         super().setUp()
@@ -634,128 +812,120 @@ class InstallFlowTest(FlowTestCase):
             if self.failing:
                 raise scramble.ScrambleError("image validation failed")
 
-        self.patch(build_and_switch=build, check_theme=lambda: None, hooked_kernels=lambda: list(self.hooked),
-                   connected_displays=lambda: [("HDMI-A-1", 1920, 1080, 527, 296)], system_font=bold_font)
+        self.patch(build_and_switch=build, check_theme=lambda: None, hooked_kernels=lambda: list(self.hooked))
 
-    def run_command(self, command, config_text=None):
-        path = None
-        if config_text is not None:
-            path = self.top + "/input/given.conf"
-            write(path, config_text)
+    def theme_file(self, settings="[scramble]\ndisplay = text\n"):
+        files, _manifest = theme.build_theme(config_from(settings))
+        path = self.top + "/input/theme.tar"
+        write_tar(path, files)
+        return path
+
+    def run_command(self, command, path=None, *, yes=True):
         with contextlib.redirect_stdout(io.StringIO()) as output:
-            command(mock.Mock(config=path, yes=True))
+            command(mock.Mock(theme=path, yes=yes))
         return output.getvalue()
 
     def state(self):
-        """Every file below the root except the images and test inputs, with its content or link target."""
         return {os.path.relpath(path, self.top): os.readlink(path) if os.path.islink(path) else read_bytes(path)
                 for path in glob.glob(self.top + "/**", recursive=True)
                 if (os.path.isfile(path) or os.path.islink(path)) and not re.search("/(boot|input)/", path)}
 
-    def test_install_adds_module_settings_and_link(self):
-        output = self.run_command(scramble.cmd_install)
+    def test_apply_and_reapply_preserve_packaged_files(self):
+        packaged = read_bytes(scramble.MODULE_DIR + "/module-setup.sh")
+        output = self.run_command(scramble.cmd_apply, self.theme_file())
         self.assertEqual(self.builds, [([self.running], True)])
-        self.assertIn("BASE_LAYOUT='us'\n", read(scramble.MODULE_DIR + "/qubes-plymouth-scramble.conf"))
-        self.assertEqual(read(scramble.CONFIG_FILE), read(os.path.join(SOURCE, "qubes-plymouth-scramble.conf")))
-        self.assertEqual(os.readlink(scramble.INSTALLED_CLI), scramble.MODULE_DIR + "/source/" + scramble.PROG)
-        for text in (f"add      {scramble.MODULE_DIR}", f"add      {scramble.CONFIG_FILE}", "keyboard layout us",
-                     f"rebuild  {self.image(self.running)}", "hybrid digit tiles"):
-            self.assertIn(text, output)
-        self.assertEqual(os.listdir(self.top + "/modules.d"), ["91qubes-scramble"], "no staging leftovers")
-
-    @unittest.skipUnless(importlib.util.find_spec("numpy") and importlib.util.find_spec("PIL") and bold_font(),
-                         "masked digits need numpy, Pillow and a bold sans-serif font")
-    def test_masked_install_writes_tiles(self):
-        output = self.run_command(scramble.cmd_install, "[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n")
-        with open(f"{scramble.MODULE_DIR}/tiles/{scramble.TILE_MANIFEST}", encoding="ascii") as stream:
-            manifest = json.load(stream)
-        self.assertEqual(sorted(os.listdir(scramble.MODULE_DIR + "/tiles")),
-                         sorted([scramble.TILE_MANIFEST, *manifest["sets"][0]["files"], manifest["sets"][0]["panel"]["name"]]))
-        self.assertIn("highpass digit tiles (tapered filter, cut-off 1.0 cycles per mm, quantization diffusion) for "
-                      "HDMI-A-1 1920x1080", output)
-        self.assertIn("qubes_scramble.sets = 1;", read(scramble.MODULE_DIR + "/keypad.script"))
-
-    def test_install_names_screens_with_text_digits(self):
-        self.patch(connected_displays=lambda: [("DP-1", 1920, 1080, 0, 0)])
-        output = self.run_command(scramble.cmd_install)
-        self.assertIn(f"{scramble.PROG}: note: DP-1 1920x1080, Plymouth scale 1 shows text digits, not masked digits: it "
-                      "reports no physical size; set ppi in the settings for masked digits", output)
-        keypad = read(scramble.MODULE_DIR + "/keypad.script")
-        self.assertIn("qubes_scramble.sets = 1;\nqubes_scramble.set[0].text = 1;", keypad)
-        self.assertEqual(os.listdir(scramble.MODULE_DIR + "/tiles"), [scramble.TILE_MANIFEST])
-
-    def test_install_follows_the_system_layout_and_kernels_with_the_module(self):
-        write(scramble.VCONSOLE_CONF, 'KEYMAP="uk"\n')
+        self.assertEqual(set(os.listdir(scramble.THEME_STATE)), {"keypad.script", *scramble.IMAGES})
+        self.assertIn(scramble.THEME_STATE, output)
+        self.assertIn(self.image(self.running), output)
+        self.assertEqual(read_bytes(scramble.MODULE_DIR + "/module-setup.sh"), packaged)
+        installed = self.state()
         self.hooked = ["0.0.1-other"]
-        self.run_command(scramble.cmd_install)
-        self.assertEqual(self.builds, [(sorted([self.running, "0.0.1-other"]), True)])
-        self.assertIn("BASE_LAYOUT='gb'\n", read(scramble.MODULE_DIR + "/qubes-plymouth-scramble.conf"))
+        self.run_command(scramble.cmd_apply)
+        self.assertEqual(self.builds[-1], (sorted([self.running, "0.0.1-other"]), True))
+        self.assertEqual(self.state(), installed)
+        self.assertEqual(os.listdir(self.top + "/state"), ["theme"], "no staging or previous copies remain")
 
-    def test_failed_install_changes_nothing(self):
-        self.failing = True
+    def test_reapply_without_a_theme_is_refused(self):
+        with self.assertRaises(scramble.ScrambleError):
+            self.run_command(scramble.cmd_apply)
+        self.assertEqual(self.builds, [])
+
+    def test_failed_apply_restores_previous_theme(self):
+        original, self.failing = self.state(), True
         with self.assertRaisesRegex(scramble.ScrambleError, "validation failed"):
-            self.run_command(scramble.cmd_install)
-        self.assertEqual(self.state(), {"etc/vconsole.conf": STOCK_VCONSOLE.encode()})
+            self.run_command(scramble.cmd_apply, self.theme_file())
+        self.assertEqual(self.state(), original)
         self.failing = False
-        self.run_command(scramble.cmd_install)
+        self.run_command(scramble.cmd_apply, self.theme_file())
         installed, self.failing = self.state(), True
         with self.assertRaises(scramble.ScrambleError):
-            self.run_command(scramble.cmd_install, "[scramble]\ndisplay = text\n[digits]\n2 = ABC\n")
-        self.assertEqual(self.state(), installed, "the previous installation is restored")
+            self.run_command(scramble.cmd_apply, self.theme_file("[scramble]\ndisplay = text\n[digits]\n2 = ABC\n"))
+        self.assertEqual(self.state(), installed)
+        self.assertEqual(os.listdir(self.top + "/state"), ["theme"])
 
-    def test_unknown_setting_stops_install_before_any_change(self):
-        self.run_command(scramble.cmd_install)
-        installed, builds = self.state(), len(self.builds)
-        write(scramble.CONFIG_FILE, "[scramble]\nenabled = yes\nconsole = no\n")
-        with self.assertRaisesRegex(scramble.ScrambleError, "unknown sections or settings: console"):
-            self.run_command(scramble.cmd_install)
-        installed[os.path.relpath(scramble.CONFIG_FILE, self.top)] = read_bytes(scramble.CONFIG_FILE)
-        self.assertEqual((self.state(), len(self.builds)), (installed, builds))
+    def test_cancelled_or_invalid_input_changes_nothing(self):
+        original = self.state()
+        with mock.patch("sys.stdin", mock.Mock(isatty=lambda: True)), mock.patch("builtins.input", return_value="n"), \
+                self.assertRaisesRegex(scramble.ScrambleError, "cancelled"):
+            self.run_command(scramble.cmd_apply, self.theme_file(), yes=False)
+        self.assertEqual(self.state(), original)
+        path = self.top + "/input/broken.tar"
+        write(path, b"not an archive")
+        with self.assertRaises(scramble.ScrambleError):
+            self.run_command(scramble.cmd_apply, path)
+        self.assertEqual(self.state(), original)
+        self.assertEqual(self.builds, [])
+        self.assertEqual(os.listdir(self.top + "/state"), [])
 
-    def test_disable_keeps_the_tool_and_builds_stock_images(self):
-        self.run_command(scramble.cmd_install)
-        self.hooked = [self.running]
-        write(scramble.CONFIG_FILE, "[scramble]\nenabled = no\n")
-        output = self.run_command(scramble.cmd_install)
-        self.assertEqual(self.builds[-1], ([self.running], False))
-        self.assertEqual(sorted(os.listdir(scramble.MODULE_DIR)), ["module-setup.sh", "source"])
-        self.assertTrue(os.path.isfile(scramble.INSTALLED_CLI), "the link still reaches the tool")
-        self.assertIn("disabled", output)
-
-    def test_uninstall_removes_everything_or_nothing(self):
-        self.run_command(scramble.cmd_install)
+    def test_remove_restores_stock_or_keeps_previous_theme(self):
+        original = self.state()
+        self.run_command(scramble.cmd_apply, self.theme_file())
         installed, self.hooked, self.failing = self.state(), [self.running], True
         with self.assertRaises(scramble.ScrambleError):
-            self.run_command(scramble.cmd_uninstall)
+            self.run_command(scramble.cmd_remove)
         self.assertEqual(self.state(), installed)
         self.failing = False
-        output = self.run_command(scramble.cmd_uninstall)
+        self.run_command(scramble.cmd_remove)
         self.assertEqual(self.builds[-1], ([self.running], False))
-        self.assertEqual(self.state(), {"etc/vconsole.conf": STOCK_VCONSOLE.encode()})
-        self.assertEqual(os.listdir(self.top + "/modules.d"), [])
-        self.assertIn(f"remove   {scramble.CONFIG_FILE}", output)
+        self.assertEqual(self.state(), original)
+        self.assertEqual(os.listdir(self.top + "/state"), [])
         self.hooked = []
-        self.assertIn("nothing to change", self.run_command(scramble.cmd_uninstall))
+        self.assertIn("nothing to change", self.run_command(scramble.cmd_remove))
 
-    def test_reinstalls_with_changed_settings_then_uninstall_leave_the_stock_state(self):
-        stock = self.state()
-        self.run_command(scramble.cmd_install)
+    def test_remove_also_cleans_images_without_theme_state(self):
         self.hooked = [self.running]
-        for settings in ("[scramble]\ndisplay = text\n", "[scramble]\ndisplay = white\nhighpass_cutoff = 1\n",
-                         "[scramble]\nenabled = no\n", "[scramble]\ndisplay = hybrid\n"):
-            write(scramble.CONFIG_FILE, settings)
-            self.run_command(scramble.cmd_install)
-        self.run_command(scramble.cmd_uninstall)
-        self.assertEqual(self.state(), stock)
-        self.assertEqual(self.builds[-1], ([self.running], False))
-        self.assertEqual(os.listdir(self.top + "/modules.d"), [], "no module, staging or previous copies left")
+        self.run_command(scramble.cmd_remove)
+        self.assertEqual(self.builds, [([self.running], False)])
+        self.assertFalse(os.path.exists(scramble.THEME_STATE))
+
+    def test_leftovers_of_an_interrupted_run_are_listed_and_deleted(self):
+        state = os.path.dirname(scramble.THEME_STATE)
+        leftovers = [f"{state}/.{scramble.PROG}-old", f"{state}/.{scramble.PROG}-abcd1234"]
+        for command, path, remaining in ((scramble.cmd_apply, self.theme_file(), ["theme"]), (scramble.cmd_remove, None, [])):
+            for directory in leftovers:
+                write(directory + "/keypad.script", "stale")
+            self.patch(image_has_hook=lambda image: False)
+            self.assertIn("interrupted run", self.run_command(scramble.cmd_status))
+            output = self.run_command(command, path)
+            for directory in leftovers:
+                self.assertIn(f"remove   {directory}  (left by an interrupted run)", output)
+            self.assertEqual(os.listdir(state), remaining)
+        self.assertNotIn("interrupted run", self.run_command(scramble.cmd_status))
+
+    def test_module_conf_uses_the_current_keyboard_layout(self):
+        for keymap, layout in (("us", "us"), ("uk", "gb")):
+            write(scramble.VCONSOLE_CONF, f'KEYMAP="{keymap}"\n')
+            self.assertIn(f"BASE_LAYOUT='{layout}'\n", self.run_command(scramble.cmd_module_conf))
 
     def test_status(self):
         self.patch(image_has_hook=lambda image: True)
-        self.run_command(scramble.cmd_install)
+        self.run_command(scramble.cmd_apply, self.theme_file())
         output = self.run_command(scramble.cmd_status)
-        for text in ("dracut module:      installed", f"initramfs:          {self.image(self.running)} scrambles"):
-            self.assertIn(text, output)
+        self.assertIn(self.image(self.running), output)
+        self.assertIn("scrambles", output)
+        self.assertNotIn("configuration:", output)
+        write(scramble.THEME_STATE + "/keypad.script", "not an overlay")
+        self.assertRegex(self.run_command(scramble.cmd_status), "applied theme: +not usable: .*no keypad overlay")
 
 
 class BuildAndSwitchTest(FlowTestCase):
@@ -783,6 +953,16 @@ class BuildAndSwitchTest(FlowTestCase):
                 raise scramble.ScrambleError(f"broken image for {kernel}")
 
         self.patch(run=run, validate_tree=validate, boot_layout=lambda kernel: "other")
+        temporary = tempfile.TemporaryDirectory
+
+        @contextlib.contextmanager
+        def staging_directory(**kwargs):
+            with temporary(**{**kwargs, "dir": self.top}) as directory:
+                yield directory
+
+        staging = mock.patch.object(scramble.tempfile, "TemporaryDirectory", staging_directory)
+        staging.start()
+        self.addCleanup(staging.stop)
 
     def leftovers(self):
         return [name for name in os.listdir(self.top + "/boot") if name.endswith("-new")]
@@ -862,141 +1042,141 @@ class LockTest(unittest.TestCase):
 
 
 @unittest.skipUnless(importlib.util.find_spec("numpy") and importlib.util.find_spec("PIL"),
-                     "masked digits need numpy and Pillow (Qubes dom0 has both)")
+                     "masked digit generation needs numpy and Pillow")
 class MaskedDigitsTest(unittest.TestCase):
     def setUp(self):
-        self.np = scramble.imaging()[0]
+        self.np = theme.imaging()[0]
 
     def masks(self):
         font = bold_font()
         if not font:
             self.skipTest("no bold sans-serif font (fc-match Sans:bold)")
-        return scramble.digit_masks(font, GLYPH_PX, TILE_PX)
+        return theme.digit_masks(font, GLYPH_PX, TILE_PX)
 
     def test_srgb_reference_points(self):
         np = self.np
-        self.assertEqual(float(scramble.srgb_encode(0.0)), 0.0)
-        self.assertAlmostEqual(float(scramble.srgb_encode(1.0)), 1.0, places=12)
-        self.assertAlmostEqual(float(scramble.srgb_encode(0.0031308)), 0.04045, places=5)
-        self.assertAlmostEqual(float(scramble.srgb_decode(0.5)), 0.214041, places=6)
+        self.assertEqual(float(theme.srgb_encode(0.0)), 0.0)
+        self.assertAlmostEqual(float(theme.srgb_encode(1.0)), 1.0, places=12)
+        self.assertAlmostEqual(float(theme.srgb_encode(0.0031308)), 0.04045, places=5)
+        self.assertAlmostEqual(float(theme.srgb_decode(0.5)), 0.214041, places=6)
         values = np.linspace(0, 1, 1001)
-        self.assertTrue(np.allclose(scramble.srgb_decode(scramble.srgb_encode(values)), values, atol=1e-12))
-        self.assertTrue(np.all(np.diff(scramble.srgb_encode(values)) > 0))
+        self.assertTrue(np.allclose(theme.srgb_decode(theme.srgb_encode(values)), values, atol=1e-12))
+        self.assertTrue(np.all(np.diff(theme.srgb_encode(values)) > 0))
 
     def test_filter_gains(self):
         np = self.np
-        frequency = scramble.spatial_frequencies(64)
+        frequency = theme.spatial_frequencies(64)
         self.assertEqual(frequency.shape, (64, 33))
         self.assertEqual(float(frequency[0, 0]), 0.0)
-        self.assertAlmostEqual(float(scramble.lowpass_gain(np.array(0.1), 0.1)), math.exp(-0.5), places=12)
-        self.assertTrue(np.allclose(scramble.gaussian_highpass_gain(frequency, 0.2),
-                                    1 - scramble.lowpass_gain(frequency, 0.2)))
-        steps = scramble.tapered_highpass_gain(np.array([0.0, 0.1, 0.15, 0.2, 0.3, 0.5]), 0.1, 0.2)
+        self.assertAlmostEqual(float(theme.lowpass_gain(np.array(0.1), 0.1)), math.exp(-0.5), places=12)
+        self.assertTrue(np.allclose(theme.gaussian_highpass_gain(frequency, 0.2),
+                                    1 - theme.lowpass_gain(frequency, 0.2)))
+        steps = theme.tapered_highpass_gain(np.array([0.0, 0.1, 0.15, 0.2, 0.3, 0.5]), 0.1, 0.2)
         self.assertTrue(np.allclose(steps, [0, 0, 0.5, 1, 1, 1]))
-        ramp = scramble.tapered_highpass_gain(np.linspace(0, 0.5, 501), 0.1, 0.2)
+        ramp = theme.tapered_highpass_gain(np.linspace(0, 0.5, 501), 0.1, 0.2)
         self.assertTrue(np.all(np.diff(ramp) >= 0))
         # the paper's sigma_lf converted to its phone screen, and the cycles per pixel of a display
-        self.assertAlmostEqual(scramble.PAPER_SIGMA_LF, 35 / (2560 / 493 * 25.4), places=3)
-        self.assertAlmostEqual(scramble.cycles_per_pixel(1.0, 254), 0.1)
+        self.assertAlmostEqual(theme.PAPER_SIGMA_LF, 35 / (2560 / 493 * 25.4), places=3)
+        self.assertAlmostEqual(theme.cycles_per_pixel(1.0, 254), 0.1)
 
     def test_filtering_is_linear_and_complementary(self):
         np = self.np
         rng = np.random.default_rng(20261105)
         images = rng.random((3, 32, 48))
         frequency = np.hypot(np.fft.fftfreq(32)[:, None], np.fft.rfftfreq(48)[None, :])
-        low = scramble.filtered(images, scramble.lowpass_gain(frequency, 0.07))
-        high = scramble.filtered(images, scramble.gaussian_highpass_gain(frequency, 0.07))
+        low = theme.filtered(images, theme.lowpass_gain(frequency, 0.07))
+        high = theme.filtered(images, theme.gaussian_highpass_gain(frequency, 0.07))
         self.assertTrue(np.allclose(low + high, images, atol=1e-12))
         self.assertTrue(np.allclose(high.mean(axis=(1, 2)), 0, atol=1e-12))
-        self.assertTrue(np.allclose(scramble.filtered(np.full((8, 8), 0.4), scramble.gaussian_highpass_gain(
-            scramble.spatial_frequencies(8), 0.1)), 0, atol=1e-15))
+        self.assertTrue(np.allclose(theme.filtered(np.full((8, 8), 0.4), theme.gaussian_highpass_gain(
+            theme.spatial_frequencies(8), 0.1)), 0, atol=1e-15))
 
     def test_tiles(self):
         np = self.np
         masks = self.masks()
         self.assertEqual(masks.shape, (10, TILE_PX, TILE_PX))
         self.assertTrue(masks.min() >= 0 and masks.max() <= 1 and all(mask.sum() > 50 for mask in masks))
-        frequency = scramble.spatial_frequencies(TILE_PX)
-        clean = scramble.tapered_highpass_gain(frequency, 0.17, 0.34)
-        low = scramble.lowpass_gain(frequency, 0.04)
-        background = float(scramble.srgb_decode(130 / 255))
-        highpass = scramble.tile_light("highpass", masks, clean, low, scramble.TileDesign(0.35, 130))
+        frequency = theme.spatial_frequencies(TILE_PX)
+        clean = theme.tapered_highpass_gain(frequency, 0.17, 0.34)
+        low = theme.lowpass_gain(frequency, 0.04)
+        background = float(theme.srgb_decode(130 / 255))
+        highpass = theme.tile_light("highpass", masks, clean, low, theme.TileDesign(0.35, 130))
         self.assertEqual(sorted(highpass), [(None, digit) for digit in range(10)])
         for image in highpass.values():
             self.assertAlmostEqual(float(image.mean()), background, places=12)
             spectrum = np.abs(np.fft.rfft2(image - background))
             self.assertLess(float(spectrum[frequency < 0.17].max()), 1e-9, "nothing below the lower edge")
-        hybrid = scramble.tile_light("hybrid", masks, clean, low, scramble.TileDesign(0.35, 130, 0.3))
+        hybrid = theme.tile_light("hybrid", masks, clean, low, theme.TileDesign(0.35, 130, 0.3))
         self.assertEqual(len(hybrid), 100)
-        decoys = 0.3 * scramble.filtered(masks, low)
+        decoys = 0.3 * theme.filtered(masks, low)
         self.assertTrue(np.allclose(hybrid[(2, 7)] - hybrid[(5, 7)], decoys[2] - decoys[5], atol=1e-12))
-        white = scramble.tile_light("white", masks, clean, low,
-                                    scramble.TileDesign(0.35, 130, 0.2, scramble.button_mask(TILE_PX, BUTTON_PX)))
+        white = theme.tile_light("white", masks, clean, low,
+                                    theme.TileDesign(0.35, 130, 0.2, theme.button_mask(TILE_PX, BUTTON_PX)))
         self.assertTrue(np.allclose(white[(None, 3)] - highpass[(None, 3)], white[(None, 4)] - highpass[(None, 4)]))
-        codes = scramble.tile_codes(highpass)
+        codes = theme.tile_codes(highpass)
         self.assertEqual(codes[(None, 0)].dtype, np.uint8)
-        plain = scramble.tile_codes({(None, 0): np.full((4, 4), background)})
+        plain = theme.tile_codes({(None, 0): np.full((4, 4), background)})
         self.assertTrue(np.all(plain[(None, 0)] == 130), "the background sits exactly on its code")
-        with self.assertRaisesRegex(scramble.ScrambleError, "outside the display range 0-1; lower alpha"):
-            scramble.tile_codes(scramble.tile_light("highpass", masks, clean, low, scramble.TileDesign(3.0, 130)))
+        with self.assertRaisesRegex(scramble.ScrambleError, "outside the display range 0-1; lower decoy_amplitude"):
+            theme.tile_codes(theme.tile_light("highpass", masks, clean, low, theme.TileDesign(3.0, 130)))
         with self.assertRaisesRegex(scramble.ScrambleError, "do not fit"):
-            scramble.digit_masks(bold_font(), TILE_PX - 2, TILE_PX)
+            theme.digit_masks(bold_font(), TILE_PX - 2, TILE_PX)
 
     def test_observer_geometry(self):
         width, height, distance = 100.0, 40.0, 500.0
-        angle_x, angle_y = scramble.observer_angles(width, height, scramble.Observer(distance, math.pi / 2, 0))
+        angle_x, angle_y = theme.observer_angles(width, height, theme.Observer(distance, math.pi / 2, 0))
         self.assertAlmostEqual(angle_x, math.degrees(2 * math.atan(width / 2 / distance)), places=10)
         self.assertAlmostEqual(angle_y, math.degrees(2 * math.atan(height / 2 / distance)), places=10)
-        side_x, _ = scramble.observer_angles(width, height, scramble.Observer(distance))
+        side_x, _ = theme.observer_angles(width, height, theme.Observer(distance))
         self.assertLess(side_x, angle_x, "the image looks narrower from 30 degrees to the side")
-        self.assertEqual(scramble.angle_factor(math.pi / 2, 0), 1.0)
-        self.assertAlmostEqual(scramble.angle_factor(math.pi / 2, math.pi / 6), 1 - (1 / 3) ** 3)
-        self.assertAlmostEqual(scramble.angle_factor(math.pi / 3, 0), scramble.angle_factor(2 * math.pi / 3, 0))
+        self.assertEqual(theme.angle_factor(math.pi / 2, 0), 1.0)
+        self.assertAlmostEqual(theme.angle_factor(math.pi / 2, math.pi / 6), 1 - (1 / 3) ** 3)
+        self.assertAlmostEqual(theme.angle_factor(math.pi / 3, 0), theme.angle_factor(2 * math.pi / 3, 0))
         np = self.np
-        self.assertTrue(np.allclose(scramble.daf_gain(np.array([0, 5, 10.3, 31, 40])), [1, 1, 1, 0, 0]))
-        curve = scramble.daf_gain(np.linspace(0, 40, 401))
+        self.assertTrue(np.allclose(theme.daf_gain(np.array([0, 5, 10.3, 31, 40])), [1, 1, 1, 0, 0]))
+        curve = theme.daf_gain(np.linspace(0, 40, 401))
         self.assertTrue(np.all(np.diff(curve) <= 1e-12))
 
     def test_structural_similarity(self):
         np = self.np
         rng = np.random.default_rng(7)
         image = rng.random((40, 40))
-        self.assertAlmostEqual(scramble.mssim(image, image), 1.0, places=12)
-        self.assertAlmostEqual(scramble.mssim(image, image * 0.5 + 0.2), scramble.mssim(image * 0.5 + 0.2, image))
-        self.assertLess(scramble.mssim(image, np.full_like(image, 0.5)), 0.2)
+        self.assertAlmostEqual(theme.mssim(image, image), 1.0, places=12)
+        self.assertAlmostEqual(theme.mssim(image, image * 0.5 + 0.2), theme.mssim(image * 0.5 + 0.2, image))
+        self.assertLess(theme.mssim(image, np.full_like(image, 0.5)), 0.2)
 
     def test_visibility_index_and_protection(self):
         masks = self.masks()
-        frequency = scramble.spatial_frequencies(TILE_PX)
-        low = scramble.lowpass_gain(frequency, scramble.cycles_per_pixel(scramble.PAPER_SIGMA_LF, PPI))
+        frequency = theme.spatial_frequencies(TILE_PX)
+        low = theme.lowpass_gain(frequency, theme.cycles_per_pixel(theme.PAPER_SIGMA_LF, PPI))
 
         def make(sigma):
-            high = scramble.gaussian_highpass_gain(frequency, scramble.cycles_per_pixel(sigma, PPI))
-            tiles = scramble.tile_light("hybrid", masks, high, low, scramble.TileDesign(0.45, 130, 0.3))
+            high = theme.gaussian_highpass_gain(frequency, theme.cycles_per_pixel(sigma, PPI))
+            tiles = theme.tile_light("hybrid", masks, high, low, theme.TileDesign(0.45, 130, 0.3))
             light = {key: value for key, value in tiles.items()
                      if key[0] in (1, 2)}
-            decoys = scramble.tile_light("hybrid", masks, high, low, scramble.TileDesign(0, 130, 0.3))
+            decoys = theme.tile_light("hybrid", masks, high, low, theme.TileDesign(0, 130, 0.3))
             return light, {key: decoys[key] for key in light}
 
-        indices = [scramble.visibility_index(*make(1.63), PPI, scramble.Observer(distance)) for distance in (300, 600, 1200)]
+        indices = [theme.visibility_index(*make(1.63), PPI, theme.Observer(distance)) for distance in (300, 600, 1200)]
         self.assertEqual(indices, sorted(indices), "the real digit fades with distance")
         _, decoys = make(1.63)
-        self.assertAlmostEqual(scramble.visibility_index(decoys, decoys, PPI, scramble.Observer(300)), 1.0, places=9)
-        width = scramble.protection_width(make, PPI, scramble.Observer(1140), (0.3, 4.4), steps=10)
+        self.assertAlmostEqual(theme.visibility_index(decoys, decoys, PPI, theme.Observer(300)), 1.0, places=9)
+        width = theme.protection_width(make, PPI, theme.Observer(1140), (0.3, 4.4), steps=10)
         self.assertTrue(0.3 < width < 4.4)
-        self.assertGreaterEqual(scramble.visibility_index(*make(width), PPI, scramble.Observer(1140)), scramble.PAPER_THRESHOLD)
-        self.assertIsNone(scramble.protection_width(make, PPI, scramble.Observer(150), (0.3, 0.5), steps=4))
-        distance = scramble.estimated_safety_distance(*make(1.63), PPI)  # whole cm: the index passes within 5 mm
+        self.assertGreaterEqual(theme.visibility_index(*make(width), PPI, theme.Observer(1140)), theme.PAPER_THRESHOLD)
+        self.assertIsNone(theme.protection_width(make, PPI, theme.Observer(150), (0.3, 0.5), steps=4))
+        distance = theme.estimated_safety_distance(*make(1.63), PPI)  # whole cm: the index passes within 5 mm
         self.assertTrue(10 < distance < 1000)
-        self.assertGreaterEqual(scramble.visibility_index(*make(1.63), PPI, scramble.Observer(10 * distance + 5)),
-                                scramble.PAPER_THRESHOLD)
-        self.assertEqual(scramble.estimated_safety_distance(decoys, decoys, PPI), 0, "hidden at 10 cm already")
+        self.assertGreaterEqual(theme.visibility_index(*make(1.63), PPI, theme.Observer(10 * distance + 5)),
+                                theme.PAPER_THRESHOLD)
+        self.assertEqual(theme.estimated_safety_distance(decoys, decoys, PPI), 0, "hidden at 10 cm already")
         bright = {key: image * 0 + 0.9 for key, image in decoys.items()}
-        self.assertIsNone(scramble.estimated_safety_distance(bright, decoys, PPI), "visible even at 10 m")
+        self.assertIsNone(theme.estimated_safety_distance(bright, decoys, PPI), "visible even at 10 m")
 
     def test_plymouth_scale2_truncation(self):
         np = self.np
-        device = scramble.plymouth_scale2(np.array([[1, 1], [9, 200]], dtype=np.uint8))
+        device = theme.plymouth_scale2(np.array([[1, 1], [9, 200]], dtype=np.uint8))
         self.assertEqual(device.shape, (4, 4, 3))
         self.assertTrue(np.array_equal(device[0::2, 0::2, 1], [[1, 1], [9, 200]]), "even pixels are the image")
         # between two pixels of code 1: red and green keep 1, blue truncates each half to 0
@@ -1009,46 +1189,46 @@ class MaskedDigitsTest(unittest.TestCase):
     def test_error_diffusion(self):
         np = self.np
         masks = self.masks()
-        frequency = scramble.spatial_frequencies(TILE_PX)
-        clean = scramble.tapered_highpass_gain(frequency, 0.12, 0.24)
-        light = scramble.tile_light("highpass", masks, clean, frequency * 0, scramble.TileDesign(0.35, 130))
+        frequency = theme.spatial_frequencies(TILE_PX)
+        clean = theme.tapered_highpass_gain(frequency, 0.12, 0.24)
+        light = theme.tile_light("highpass", masks, clean, frequency * 0, theme.TileDesign(0.35, 130))
         # below half the cut-off, where cameras too coarse for the high-pass band still see the
         # rounding error; error diffusion pushes it toward the cut-off
         keep = (frequency < 0.06).astype(float)
 
         def coarse_error(codes):
-            return float(np.sqrt(np.mean([np.mean(scramble.filtered(scramble.srgb_decode(codes[key] / 255) - light[key],
+            return float(np.sqrt(np.mean([np.mean(theme.filtered(theme.srgb_decode(codes[key] / 255) - light[key],
                                                                     keep) ** 2) for key in light])))
 
-        rounded, diffused = scramble.tile_codes(light), scramble.diffused_codes(light)
+        rounded, diffused = theme.tile_codes(light), theme.diffused_codes(light)
         self.assertLess(coarse_error(diffused), coarse_error(rounded) / 3)
         self.assertLessEqual(max(int(np.abs(diffused[key].astype(int) - rounded[key]).max()) for key in light), 1)
-        self.assertTrue(all(np.array_equal(diffused[key], scramble.diffused_codes(light)[key]) for key in light))
+        self.assertTrue(all(np.array_equal(diffused[key], theme.diffused_codes(light)[key]) for key in light))
         with self.assertRaisesRegex(scramble.ScrambleError, "outside the display range 0-1"):
-            scramble.diffused_codes(scramble.tile_light("highpass", masks, clean, frequency * 0,
-                                                        scramble.TileDesign(3.0, 130)))
+            theme.diffused_codes(theme.tile_light("highpass", masks, clean, frequency * 0,
+                                                        theme.TileDesign(3.0, 130)))
 
     def test_scale2_compensation(self):
         np = self.np
         masks = self.masks()
-        frequency = scramble.spatial_frequencies(TILE_PX)
-        clean = scramble.tapered_highpass_gain(frequency, 0.12, 0.24)
-        light = {key: value for key, value in scramble.tile_light(
-            "highpass", masks, clean, frequency * 0, scramble.TileDesign(0.29, 160)).items() if key[1] in (0, 8)}
+        frequency = theme.spatial_frequencies(TILE_PX)
+        clean = theme.tapered_highpass_gain(frequency, 0.12, 0.24)
+        light = {key: value for key, value in theme.tile_light(
+            "highpass", masks, clean, frequency * 0, theme.TileDesign(0.29, 160)).items() if key[1] in (0, 8)}
         keep = (frequency < 0.06).astype(float)
 
         def coarse_error(codes):
-            shown = scramble.device_light(scramble.plymouth_scale2(codes))
+            shown = theme.device_light(theme.plymouth_scale2(codes))
             mean = shown.reshape(TILE_PX, 2, TILE_PX, 2).mean(axis=(1, 3))
-            return float(np.sqrt(np.mean(scramble.filtered(mean - light[(None, 8)], keep) ** 2)))
+            return float(np.sqrt(np.mean(theme.filtered(mean - light[(None, 8)], keep) ** 2)))
 
-        plain = scramble.tile_codes(light)
-        compensated, remaining = scramble.scale2_tile_codes(light, keep)
+        plain = theme.tile_codes(light)
+        compensated, remaining = theme.scale2_tile_codes(light, keep)
         self.assertLess(coarse_error(compensated[(None, 8)]), coarse_error(plain[(None, 8)]) / 2)
         self.assertLess(remaining, 5e-4)
 
     def test_device_scale_rules(self):
-        scale = scramble.plymouth_device_scale
+        scale = theme.plymouth_device_scale
         self.assertEqual(scale(1920, 1080, 344, 194), 1)
         self.assertEqual(scale(2560, 1600, 286, 179), 2)
         self.assertEqual(scale(2560, 1600, 0, 0), 1)
@@ -1058,58 +1238,27 @@ class MaskedDigitsTest(unittest.TestCase):
         self.assertEqual(scale(2560, 1600, 0, 0, guess=True), 2)
         self.assertEqual(scale(1920, 1200, 0, 0, guess=True), 1)
 
-    def test_edid(self):
-        self.assertEqual(scramble.edid_mode(synthetic_edid(1920, 1080, 344, 194)), (1920, 1080, 344, 194))
-        self.assertEqual(scramble.edid_mode(synthetic_edid(3840, 2400, 0, 0, width_cm=34, height_cm=21)), (3840, 2400, 340, 210))
-        broken = bytearray(synthetic_edid(1920, 1080, 344, 194))
-        broken[60] ^= 1
-        with self.assertRaisesRegex(scramble.ScrambleError, "checksum"):
-            scramble.edid_mode(bytes(broken))
-        rng = random.Random(20261105)
-        for _ in range(300):
-            data = bytes(rng.randrange(256) for _ in range(rng.choice((0, 64, 128, 256))))
-            if rng.random() < 0.5 and len(data) >= 128:
-                data = b"\x00\xff\xff\xff\xff\xff\xff\x00" + data[8:127] + bytes([-sum(b"\x00\xff\xff\xff\xff\xff\xff\x00"
-                                                                                    + data[8:127]) % 256]) + data[128:]
-            try:
-                mode = scramble.edid_mode(data)
-            except scramble.ScrambleError:
-                continue
-            self.assertEqual(len(mode), 4)
-            self.assertTrue(all(isinstance(value, int) and value >= 0 for value in mode))
 
-    def test_connected_displays(self):
-        root = tempfile.mkdtemp(prefix="scramble-sysfs-")
-        self.addCleanup(shutil.rmtree, root)
-        drm = root + scramble.DRM_CLASS
-        for connector, status, edid in (("card0-eDP-1", "connected", synthetic_edid(1920, 1080, 344, 194)),
-                                        ("card0-DP-1", "disconnected", b""), ("card1-HDMI-A-1", "connected", bytes(128)),
-                                        ("card1-DP-2", "connected", b"")):
-            write(f"{drm}/{connector}/status", status + "\n")
-            write(f"{drm}/{connector}/edid", edid)
-        write(f"{drm}/card0/dev", "226:0\n")
-        self.assertEqual(scramble.connected_displays(root), [("eDP-1", 1920, 1080, 344, 194)])
-        self.assertEqual(scramble.connected_displays(root + "/missing"), [])
 
     def test_tile_targets_follow_both_scale_rules(self):
         config = config_from("[scramble]\ndisplay = hybrid\n")
         # 1920x1200 at 200 ppi: the EDID rule gives scale 2, the simpledrm guess scale 1
-        targets = scramble.tile_targets(config, [("eDP-1", 1920, 1200, 244, 152)])
+        targets = theme.tile_targets(config, [("eDP-1", 1920, 1200, 244, 152)])
         self.assertEqual([(target["scale"], target["width"], target["height"]) for target in targets],
                          [(1, 1920, 1200), (2, 960, 600)])
         self.assertAlmostEqual(targets[1]["ppi"], targets[0]["ppi"] / 2, delta=0.1)
-        self.assertEqual(len(scramble.tile_targets(config, [("eDP-1", 2560, 1600, 286, 179)])), 1, "both rules give 2")
+        self.assertEqual(len(theme.tile_targets(config, [("eDP-1", 2560, 1600, 286, 179)])), 1, "both rules give 2")
         fixed = config_from("[scramble]\ndisplay = hybrid\nppi = 150\n")
-        self.assertEqual(scramble.tile_targets(fixed, [("DP-1", 1920, 1080, 0, 0)])[0]["ppi"], 150.0)
-        self.assertEqual(scramble.tile_targets(fixed, []),
+        self.assertEqual(theme.tile_targets(fixed, [("DP-1", 1920, 1080, 0, 0)])[0]["ppi"], 150.0)
+        self.assertEqual(theme.tile_targets(fixed, []),
                          [{"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": 150.0}])
         # without a physical size or ppi the targets have no density (text digits)
-        self.assertEqual(scramble.tile_targets(config, []),
+        self.assertEqual(theme.tile_targets(config, []),
                          [{"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": None}])
-        self.assertEqual([target["ppi"] for target in scramble.tile_targets(config, [("DP-1", 1920, 1080, 0, 0)])], [None])
+        self.assertEqual([target["ppi"] for target in theme.tile_targets(config, [("DP-1", 1920, 1080, 0, 0)])], [None])
 
     def test_screens_that_cannot_show_masked_digits(self):
-        unavailable = scramble.masked_digits_unavailable
+        unavailable = theme.masked_digits_unavailable
         config = config_from("[scramble]\ndisplay = hybrid\n")
         # 27 inch 2560x1440 and 32 inch 3840x2160 screens at the simpledrm guess of scale 2; the first at scale 1
         target = {"display": "DP-1", "scale": 2, "width": 1280, "height": 720, "ppi": 54.44}
@@ -1118,7 +1267,7 @@ class MaskedDigitsTest(unittest.TestCase):
                          "camera_floor 1.2 cycles per mm is finer than the screen shows (at most 0.95)")
         self.assertIsNone(unavailable(config, {**target, "scale": 1, "width": 2560, "height": 1440, "ppi": 108.89}))
         self.assertEqual(unavailable(config, {**target, "ppi": None}),
-                         "it reports no physical size; set ppi in the settings for masked digits")
+                         "its physical size is not configured; set ppi in the settings for masked digits")
         self.assertEqual(unavailable(config_from("[scramble]\nsize = 0.5\n"), {**target, "ppi": 92.62}),
                          "size 0.5 makes 16 px tiles, under 24 px")
         self.assertEqual(unavailable(config_from("[scramble]\nhighpass_cutoff = 3\n"), {**target, "ppi": 141.6}),
@@ -1127,7 +1276,7 @@ class MaskedDigitsTest(unittest.TestCase):
     def test_tile_summary_names_the_display_as_reported(self):
         config = config_from("[scramble]\ndisplay = hybrid\nhighpass_cutoff = 0.6\n")
         # a 2560x1600 screen of 641x401 mm: scale 1 by its size, scale 2 by the simpledrm guess
-        targets = scramble.tile_targets(config, [("DP-1", 2560, 1600, 641, 401)])
+        targets = theme.tile_targets(config, [("DP-1", 2560, 1600, 641, 401)])
         self.assertEqual([(target["width"], target["ppi"]) for target in targets], [(2560, 101.39), (1280, 50.7)])
         sets = [{**target, "cutoff": 0.6, "estimated_safety_distance_cm": distance}
                 for target, distance in zip(targets * 2, (92, 0, None, 10), strict=True)]
@@ -1140,7 +1289,7 @@ class MaskedDigitsTest(unittest.TestCase):
                         summary[1])
         self.assertTrue(summary[2].endswith("distance over 1000 cm"))
         self.assertTrue(summary[3].endswith("distance 10 cm (too close: you may not read these digits either)"))
-        unknown = scramble.tile_targets(config_from("[scramble]\ndisplay = hybrid\nppi = 150\n"), [])[0]
+        unknown = theme.tile_targets(config_from("[scramble]\ndisplay = hybrid\nppi = 150\n"), [])[0]
         self.assertEqual(scramble.target_text(unknown), "unknown at 150 ppi, Plymouth scale 1")
 
     def test_tiles_and_manifest(self):
@@ -1148,10 +1297,10 @@ class MaskedDigitsTest(unittest.TestCase):
         if not font:
             self.skipTest("no bold sans-serif font (fc-match Sans:bold)")
         config = config_from("[scramble]\ndisplay = hybrid\n")
-        files, manifest = scramble.make_tiles(config, [("HDMI-A-1", 1920, 1080, 527, 296)], font)
+        files, manifest = theme.make_tiles(config, [("HDMI-A-1", 1920, 1080, 527, 296)], font)
         tiles = manifest["sets"][0]
         self.assertEqual((len(files), tiles["scale"], tiles["cell"], tiles["cutoff"]),
-                         (101, 1, 32, scramble.CAMERA_FLOOR))
+                         (101, 1, 32, theme.CAMERA_FLOOR))
         panel = imaging_image(files[tiles["panel"]["name"]])
         self.assertEqual((panel.size, panel.getextrema()), (scramble.keypad_row(32, True), ((130, 130),) * 3),
                          "one opaque panel in the background code, as wide as the digit row and its margins")
@@ -1163,6 +1312,13 @@ class MaskedDigitsTest(unittest.TestCase):
         manifest_path = f"{directory}/{scramble.TILE_MANIFEST}"
         write(manifest_path, json.dumps(manifest))
         self.assertEqual(scramble.check_tiles(directory, manifest_path)["display"], "hybrid")
+        broken = copy.deepcopy(manifest)
+        renamed = broken["sets"][0]["files"]
+        renamed["qubes-scramble-tile0-7.png"] = renamed.pop("qubes-scramble-tile0-3-7.png")
+        write(manifest_path, json.dumps(broken))
+        with self.assertRaises(scramble.ScrambleError):
+            scramble.check_tiles(directory, manifest_path)
+        write(manifest_path, json.dumps(manifest))
         name = "qubes-scramble-tile0-3-7.png"
         write(f"{directory}/{name}", files[name][:-1] + bytes([files[name][-1] ^ 1]))
         with self.assertRaisesRegex(scramble.ScrambleError, f"tile {name} does not match its manifest"):
@@ -1170,49 +1326,100 @@ class MaskedDigitsTest(unittest.TestCase):
         os.unlink(f"{directory}/{name}")
         with self.assertRaisesRegex(scramble.ScrambleError, f"tile {name} is not readable"):
             scramble.check_tiles(directory, manifest_path)
-        files, manifest = scramble.make_tiles(config_from("[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\npanel = no\n"),
-                                              [("HDMI-A-1", 1920, 1080, 527, 296)], font)
+        highpass = "[scramble]\ndisplay = hybrid\ndecoy_amplitude = 0\nhighpass_cutoff = 1\n"
+        files, manifest = theme.make_tiles(config_from(highpass + "panel = no\n"),
+                                           [("HDMI-A-1", 1920, 1080, 527, 296)], font)
         self.assertEqual((len(files), manifest["sets"][0]["cutoff"], manifest["quantization"], "panel" in manifest["sets"][0]),
                          (10, 1.0, "diffusion", False))
-        quantized = {method: scramble.make_tiles(config_from(f"[scramble]\ndisplay = highpass\nhighpass_cutoff = 1\n"
-                                                             f"quantization = {method}\n"),
-                                                 [("HDMI-A-1", 1920, 1080, 527, 296)], font)[0]
+        quantized = {method: theme.make_tiles(config_from(highpass + f"quantization = {method}\n"),
+                                              [("HDMI-A-1", 1920, 1080, 527, 296)], font)[0]
                      for method in ("round", "compensate")}
         self.assertEqual(quantized["round"], quantized["compensate"], "compensation applies at scale 2 only")
         self.assertNotEqual(quantized["round"], files)
         # a screen too coarse for the camera floor gets a text set, without tiles
-        manifest = scramble.make_tiles(config, [("DP-1", 1920, 1080, 600, 340)], font)[1]
+        manifest = theme.make_tiles(config, [("DP-1", 1920, 1080, 600, 340)], font)[1]
         write(manifest_path, json.dumps(manifest))
         self.assertEqual(scramble.check_tiles(directory, manifest_path)["sets"][0]["text"],
                          "camera_floor 1.2 cycles per mm is finer than the screen shows (at most 1.12)")
         self.assertIn("qubes_scramble.set[0].text = 1; qubes_scramble.set[0].width = 1920; "
-                      "qubes_scramble.set[0].height = 1080;", scramble.render_overlay(config, read(TEMPLATE), manifest))
+                      "qubes_scramble.set[0].height = 1080;", theme.render_overlay(config, read(TEMPLATE), manifest))
         self.assertEqual(scramble.tile_summary(manifest), "text digits for DP-1 1920x1080 at 81 ppi, Plymouth scale 1, "
                          "which cannot show masked digits: camera_floor 1.2 cycles per mm is finer than the screen "
                          "shows (at most 1.12)")
+
+    def test_manifest_requires_valid_types_paths_and_exact_digit_coverage(self):
+        config = config_from("[scramble]\ndisplay = hybrid\ndecoy_amplitude = 0\nhighpass_cutoff = 1\n")
+        files, valid = theme.make_tiles(config, config.screens, bold_font())
+        with tempfile.TemporaryDirectory() as directory:
+            for name, data in files.items():
+                write(f"{directory}/{name}", data)
+            manifests = [[], None, {}, {**valid, "sets": []}, {**valid, "sets": [None]}, {**valid, "version": True}]
+            for field, value in (("prefix", "../tile-"), ("cell", -1), ("cell", True), ("files", []),
+                                 ("files", {f"qubes-scramble-tile0-0-{digit}.png": "0" * 64 for digit in range(10)})):
+                broken = copy.deepcopy(valid)
+                broken["sets"][0][field] = value
+                manifests.append(broken)
+            for field in ("ppi", "estimated_safety_distance_cm"):
+                broken = copy.deepcopy(valid)
+                del broken["sets"][0][field]
+                manifests.append(broken)
+            for manifest in manifests:
+                with self.subTest(manifest=manifest), self.assertRaises(scramble.ScrambleError):
+                    path = directory + "/manifest.json"
+                    write(path, json.dumps(manifest))
+                    scramble.check_tiles(directory, path)
+            for amplitude, expected in ((0, "highpass"), (0.3, "hybrid")):
+                config = config_from(f"[scramble]\ndisplay = hybrid\ndecoy_amplitude = {amplitude}\n")
+                self.assertEqual(config.display, expected)
+            self.assertEqual(len(valid["sets"][0]["files"]), 10)
+
+    def test_preview_tiles_match_boot_pixels_at_each_scale(self):
+        for screen, scale in (("1920x1080 527x296mm", 1), ("2560x1600 286x179mm", 2)):
+            config = config_from(f"[scramble]\ndisplay = hybrid\ndecoy_amplitude = 0\nhighpass_cutoff = 1\n"
+                                 f"screens = {screen}\n", screens=False)
+            files, manifest = theme.build_theme(config)
+            entry = manifest["sets"][0]
+            self.assertEqual(entry["scale"], scale)
+            keypad = theme.preview_keypad(config, files, entry)
+            # The fixed example map makes key 1 enter 3; the tile starts below the 52 px key/arrow rows and panel margin.
+            with imaging_image(files[entry["prefix"] + "3.png"]) as tile:
+                pixels = self.np.asarray(tile)
+            expected = theme.plymouth_scale2(pixels[:, :, 0]) if scale == 2 else pixels
+            left = (scramble.PANEL_MARGIN + (max(scramble.CAP_CELL, entry["cell"]) - entry["cell"]) // 2) * scale
+            top = (52 + 2 * scramble.PANEL_MARGIN) * scale
+            actual = self.np.asarray(keypad)[top:top + expected.shape[0], left:left + expected.shape[1]]
+            self.assertTrue(self.np.array_equal(actual, expected), f"Plymouth scale {scale}")
+            self.assertIn("decoy amplitude 0;", " ".join(theme.preview_captions(config, entry)))
+            onlooker = self.np.asarray(theme.preview_onlooker(config, keypad, entry)[0])
+            background = self.np.asarray(keypad)[0, 0] @ self.np.array([0.2126, 0.7152, 0.0722])
+            self.assertLess(abs(float(onlooker[0, 0, 0]) - background), 3, "the light panel must not wrap to the top")
+            preview = theme.preview_image(config)
+            self.assertEqual(preview.mode, "RGB")
+            self.assertGreaterEqual(preview.width, keypad.width)
+            self.assertGreater(preview.height, 2 * keypad.height, "includes labels and the onlooker view")
 
     def test_size_scales_the_digits_but_not_the_model(self):
         font = bold_font()
         if not font:
             self.skipTest("no bold sans-serif font (fc-match Sans:bold)")
         display = [("HDMI-A-1", 1920, 1080, 527, 296)]
-        base = scramble.make_tiles(config_from("[scramble]\ndisplay = hybrid\n"), display, font)[1]["sets"][0]
+        base = theme.make_tiles(config_from("[scramble]\ndisplay = hybrid\n"), display, font)[1]["sets"][0]
         config = config_from("[scramble]\ndisplay = hybrid\nsize = 1.5\n")
-        manifest = scramble.make_tiles(config, display, font)[1]
+        manifest = theme.make_tiles(config, display, font)[1]
         tiles = manifest["sets"][0]
         # the tile grows with the digit; cut-off and estimate stay those of the default size
         self.assertEqual((tiles["cell"], tiles["cutoff"], tiles["estimated_safety_distance_cm"]),
-                         (scramble.tile_pixels(1.5, tiles["ppi"]), base["cutoff"], base["estimated_safety_distance_cm"]))
+                         (theme.tile_pixels(1.5, tiles["ppi"]), base["cutoff"], base["estimated_safety_distance_cm"]))
         self.assertEqual((tiles["cell"], tiles["panel"]["width"], tiles["panel"]["height"]), (50, 566, 62))
-        overlay = scramble.render_overlay(config, read(TEMPLATE), manifest)
+        overlay = theme.render_overlay(config, read(TEMPLATE), manifest)
         for line in ('qubes_scramble.set[0].panel = "qubes-scramble-tile0-panel.png";',
                      'qubes_scramble.digit_font = "Sans Bold 30";'):
             self.assertIn(line, overlay)
         self.assertIn("quantization diffusion, size 1.5)", scramble.tile_summary(manifest))
         with self.assertRaisesRegex(scramble.ScrambleError, r"need a digit row of 1266x132 px, the screen leaves 1240x168 px "
                                                             r"under the key caps; use size 2\.9 or less"):
-            scramble.make_tiles(config_from("[scramble]\nsize = 3\n"), [("eDP-1", 1280, 800, 286, 179)], font)
-        self.assertEqual(scramble.make_tiles(config_from("[scramble]\nsize = 0.5\n"), display, font)[1]["sets"][0]["text"],
+            theme.make_tiles(config_from("[scramble]\nsize = 3\n"), [("eDP-1", 1280, 800, 286, 179)], font)
+        self.assertEqual(theme.make_tiles(config_from("[scramble]\nsize = 0.5\n"), display, font)[1]["sets"][0]["text"],
                          "size 0.5 makes 16 px tiles, under 24 px")
 
 
@@ -1236,7 +1443,7 @@ class FuzzTest(unittest.TestCase):
             except scramble.ScrambleError:
                 continue
             valid += 1
-            self.assertIsInstance(config.enabled, bool)
+            self.assertTrue(0 <= config.decoy_amplitude <= 0.6)
             for letters, colour in zip(config.letters, config.colors, strict=True):
                 self.assertRegex(letters, r"^[A-Z]{0,8}$")
                 self.assertTrue(len(colour) == 3 and all(0 <= channel <= 1 for channel in colour))
@@ -1253,7 +1460,7 @@ class FuzzTest(unittest.TestCase):
                 else:
                     data = b"\n".join(self.random.choice(lines) for _ in range(self.random.randint(0, 6)))
                 write(path, data)
-                for parse in (lambda: scramble.Config(path), lambda: scramble.read_theme_map(path),
+                for parse in (lambda: theme.Config(path), lambda: scramble.read_theme_map(path),
                               lambda: scramble.system_layout(scramble.read_vconsole(path), path)):
                     try:
                         parse()

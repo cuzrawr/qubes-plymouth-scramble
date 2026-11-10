@@ -1,0 +1,1047 @@
+#!/usr/bin/python3
+"""Build a complete Plymouth scramble theme in a qube.
+
+Run without options to build the theme archive, or with --preview to view the first screen's
+keypad and its modelled onlooker view. Settings live in ~/.config/qubes-plymouth-scramble.conf.
+"""
+
+import argparse
+import collections
+import configparser
+import dataclasses
+import datetime
+import functools
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+SOURCE_DIR = os.path.dirname(os.path.realpath(__file__))
+PROG = "qubes-plymouth-scramble-theme"
+CONFIG_FILE = os.path.expanduser("~/.config/qubes-plymouth-scramble.conf")
+THEME_ARCHIVE = "qubes-plymouth-scramble-theme.tar"
+
+
+def load_base():
+    """Load the shared validation code alongside the builder once per interpreter."""
+    name = "qubes_plymouth_scramble_base"
+    if name not in sys.modules:
+        loader = importlib.machinery.SourceFileLoader(name, os.path.join(SOURCE_DIR, "qubes-plymouth-scramble"))
+        spec = importlib.util.spec_from_loader(name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+    return sys.modules[name]
+
+
+base = load_base()
+ScrambleError, expect, read = base.ScrambleError, base.expect, base.read
+OVERLAY_MARKER, IMAGES, MASK_MODES = base.OVERLAY_MARKER, base.IMAGES, base.MASK_MODES
+READABLE_CM, CAP_CELL, COLUMN_GAP, PANEL_MARGIN = base.READABLE_CM, base.CAP_CELL, base.COLUMN_GAP, base.PANEL_MARGIN
+TILE_PREFIX, TILE_MANIFEST = base.TILE_PREFIX, base.TILE_MANIFEST
+keypad_row, check_tiles, target_text = base.keypad_row, base.check_tiles, base.target_text
+distance_text, tile_summary = base.distance_text, base.tile_summary
+
+
+# Settings of [scramble]; the masked-digit names follow the IllusionPIN paper.
+SETTINGS = ("display", "decoy_amplitude", "size", "panel", "safety_distance", "highpass_filter", "highpass_cutoff",
+            "camera_floor", "lowpass_sigma", "quantization", "screens", "output", "ppi")
+
+
+def parse_screens(value, path="settings"):
+    """Parse explicit modes or xrandr connected headers into the display tuples tile_targets uses.
+
+    An xrandr connected header supplies the active desktop mode, not the preferred boot mode.
+    A disconnected or inactive connector is refused rather than guessed.
+    """
+    expect(len(value) <= 16384, f"{path}: screens exceeds 16384 characters")
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    expect(len(lines) <= 16, f"{path}: screens supports at most 16 screens")
+    screens = []
+    connector = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
+    compact = rf"(?:(?P<name>{connector})\s+)?(?P<w>[0-9]{{1,5}})x(?P<h>[0-9]{{1,5}})"
+    compact += r"(?:\s+(?P<mmw>[0-9]{1,5})x(?P<mmh>[0-9]{1,5})mm)?"
+    connected = rf"(?P<name>{connector})\s+connected(?:\s+primary)?\s+"
+    connected += r"(?P<w>[0-9]{1,5})x(?P<h>[0-9]{1,5})[+-][0-9]{1,5}[+-][0-9]{1,5}"
+    connected += r"(?:\s+\([^\r\n()]{0,256}\))?\s+(?P<mmw>[0-9]{1,5})mm\s+x\s+(?P<mmh>[0-9]{1,5})mm"
+    for index, line in enumerate(lines):
+        match = re.fullmatch(compact, line) or re.fullmatch(connected, line)
+        expect(match, f"{path}: screens line {index + 1}: expected '1920x1080 300x170mm' or an active "
+               "xrandr connected header; enter the preferred mode marked + in dom0's xrandr output")
+        width, height = int(match["w"]), int(match["h"])
+        width_mm, height_mm = int(match["mmw"] or 0), int(match["mmh"] or 0)
+        expect(0 < width <= 16384 and 0 < height <= 16384 and width_mm <= 10000 and height_mm <= 10000,
+               f"{path}: screens line {index + 1}: pixels must be 1-16384 and physical dimensions 0-10000 mm")
+        screens.append((match["name"] or f"screen{index + 1}", width, height, width_mm, height_mm))
+    return screens
+
+
+class Config:
+    """Validated builder settings; display holds the internal tile mode."""
+
+    def __init__(self, path):
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            with open(path, encoding="utf-8") as stream:
+                parser.read_file(stream)
+            self.panel = parser.getboolean("scramble", "panel", fallback=True)
+        except (OSError, UnicodeDecodeError, ValueError, configparser.Error) as error:
+            raise ScrambleError(f"cannot read configuration {path}: {error}") from None
+        scramble = parser["scramble"] if parser.has_section("scramble") else {}
+        expect("enabled" not in scramble, f"{path}: enabled is no longer a builder setting; apply or remove the theme "
+               "in dom0 with qubes-plymouth-scramble")
+        unknown = (set(parser.sections()) - {"scramble", "digits"}) | (set(scramble) - set(SETTINGS))
+        expect(not unknown, f"{path}: unknown sections or settings: {', '.join(sorted(unknown))} (valid are "
+               f"{', '.join(SETTINGS)} in [scramble] and the digits 0-9 in [digits])")
+
+        def number(name, default, low, high, unit):
+            if name not in scramble:
+                return default
+            try:
+                value = float(scramble[name])
+            except ValueError:
+                value = math.nan
+            expect(low <= value <= high, f"{path}: {name} = {scramble[name]}: expected a number from {low} to {high} ({unit})")
+            return value
+
+        display = scramble.get("display", "hybrid")
+        expect(display != "highpass", f"{path}: display = highpass is replaced; use display = hybrid with decoy_amplitude = 0")
+        expect(display in ("text", "hybrid", "white"), f"{path}: display = {display}: expected text, hybrid, white")
+        self.decoy_amplitude = number("decoy_amplitude", BETA, 0, 0.6, "linear-light amplitude")
+        self.display = "highpass" if display != "text" and self.decoy_amplitude == 0 else display
+        self.highpass_filter = scramble.get("highpass_filter", "tapered")
+        expect(self.highpass_filter in HIGHPASS_FILTERS, f"{path}: highpass_filter = {self.highpass_filter}: "
+               f"expected {' or '.join(HIGHPASS_FILTERS)}")
+        self.safety_distance = number("safety_distance", 114.0, 20, 1000, "cm")
+        self.highpass_cutoff = (None if scramble.get("highpass_cutoff", "auto") == "auto"
+                               else number("highpass_cutoff", None, 0.1, 10, "cycles per mm, or auto"))
+        self.camera_floor = number("camera_floor", CAMERA_FLOOR, 0, 10, "cycles per mm")
+        self.lowpass_sigma = number("lowpass_sigma", PAPER_SIGMA_LF, 0.02, 5, "cycles per mm")
+        self.quantization = scramble.get("quantization", "diffusion")
+        expect(self.quantization in QUANTIZATIONS, f"{path}: quantization = {self.quantization}: expected "
+               f"{', '.join(QUANTIZATIONS)}")
+        self.ppi = number("ppi", None, 50, 1000, "screen pixels per inch")
+        self.size = number("size", 1.0, 0.5, 3, "times the default digit size")
+        self.screens = parse_screens(scramble.get("screens", ""), path)
+        expect(self.display == "text" or self.screens, f"{path}: set screens for masked digits; run xrandr in dom0 "
+               "and enter the preferred mode marked + with its physical dimensions")
+        self.screen_notes = (["xrandr connected headers use the active mode; check it matches the preferred mode marked +"]
+                             if " connected " in scramble.get("screens", "") else [])
+        output = scramble.get("output", "~/QubesPlymouthScramble").strip()
+        expect(output and not any(ord(char) < 32 or ord(char) == 127 for char in output),
+               f"{path}: output must be a nonempty path without control characters")
+        self.output = os.path.abspath(os.path.expanduser(output))
+        self.digit_style(parser, path, display)
+
+    def digit_style(self, parser, path, display):
+        """Letters and colours are supported only for unmasked text digits."""
+        self.letters, self.colors = [""] * 10, [(1.0, 1.0, 1.0)] * 10
+        styles = parser.items("digits", raw=True) if parser.has_section("digits") else []
+        expect(self.display == "text" or not styles, f"{path}: display = {display} draws the digits as images "
+               "without letters or colours, which would give them away; remove [digits] or use display = text")
+        for key, value in styles:
+            match = re.fullmatch(r"([A-Z]{0,8})\s*(#[0-9A-Fa-f]{6})?", value.strip())
+            expect(re.fullmatch(r"[0-9]", key) and match, f"{path}: [digits] '{key} = {value}': expected a "
+                   "digit = up to 8 capital letters and an optional #rrggbb colour")
+            self.letters[int(key)] = match[1]
+            if match[2]:
+                self.colors[int(key)] = tuple(channel / 255 for channel in bytes.fromhex(match[2][1:]))
+
+
+def render_overlay(config, template, manifest=None):
+    """The keypad overlay with the digit letters and colours of the configuration and the tile
+    sets of a tile manifest (none for text digits)."""
+    lines = [f'qubes_scramble.letters["{digit}"] = "{config.letters[digit]}"; '
+             f'qubes_scramble.red["{digit}"] = {red:.3f}; qubes_scramble.green["{digit}"] = {green:.3f}; '
+             f'qubes_scramble.blue["{digit}"] = {blue:.3f};'
+             for digit, (red, green, blue) in enumerate(config.colors)]
+    sets = manifest["sets"] if manifest else []
+    tiles = [f"qubes_scramble.sets = {len(sets)};"]
+    for index, entry in enumerate(sets):
+        if "text" in entry:  # a screen that cannot show masked digits
+            tiles.append(f"qubes_scramble.set[{index}].text = 1; qubes_scramble.set[{index}].width = {entry['width']}; "
+                         f"qubes_scramble.set[{index}].height = {entry['height']};")
+            continue
+        panel = entry["panel"]["name"] if "panel" in entry else ""
+        tiles.append(f'qubes_scramble.set[{index}].prefix = "{entry["prefix"]}"; qubes_scramble.set[{index}].keyed = '
+                     f'{int(manifest["display"] == "hybrid")}; qubes_scramble.set[{index}].cell = {entry["cell"]}; '
+                     f'qubes_scramble.set[{index}].width = {entry["width"]}; qubes_scramble.set[{index}].height = '
+                     f'{entry["height"]}; qubes_scramble.set[{index}].panel = "{panel}";')
+    layout = (f"qubes_scramble.cell = {CAP_CELL}; qubes_scramble.gap = {COLUMN_GAP}; qubes_scramble.margin = "
+              f'{PANEL_MARGIN}; qubes_scramble.digit_font = "Sans Bold {round(DIGIT_FONT_PT * config.size)}";')
+    text = (template.replace("@MARKER@", OVERLAY_MARKER).replace("@DIGIT_STYLE@", "\n".join(lines))
+            .replace("@TILE_SETS@", "\n".join(tiles)).replace("@LAYOUT@", layout))
+    expect("@" not in text, "keypad template has unreplaced placeholders")
+    return text
+
+
+# Masked digits after IllusionPIN (arXiv 1708.06508), with the paper's names: "highpass" draws the
+# high-pass image of each real digit, readable up close and fading with distance; "hybrid" adds the
+# low-pass standard keypad, which dominates from farther away; "white" adds low-pass white buttons
+# (the paper's white keypad, section 9). Tiles are composed in linear light on a background that
+# sits exactly on an 8-bit code, refused rather than clipped, and opaque, so no theme colour
+# enters. Frequencies are in cycles per pixel. Only the builder uses numpy and Pillow.
+HIGHPASS_FILTERS = ("tapered", "gaussian")
+QUANTIZATIONS = ("diffusion", "round", "compensate")
+# Lowest high-pass cut-off (cycles per mm) the paper's search may choose by default: zoomed phone
+# photos resolve coarser patterns
+CAMERA_FLOOR = 1.2
+# An observer of the visibility algorithm: distance and spherical angles; theta pi/2 and phi 0 is
+# straight in front of the image, and the paper's threat model puts phi 30 degrees to the side
+Observer = collections.namedtuple("Observer", "distance_mm theta phi", defaults=(math.pi / 2, math.pi / 6))
+
+
+@dataclasses.dataclass(frozen=True)
+class TileDesign:
+    """A tile is pedestal + alpha * high-pass(real digit) + beta * low-pass(decoy) in linear light:
+    the paper's I = I_u^h + I_s^l (section 5.1) with gains and a uniform background. pedestal_code
+    is the background's 8-bit code; button is the white keypad's button mask (white mode)."""
+    alpha: float
+    pedestal_code: int
+    beta: float = 0.0
+    button: object = None
+
+
+@functools.cache
+def imaging():
+    """numpy and Pillow (with Image, ImageDraw and ImageFont loaded) for masked digits."""
+    try:
+        import numpy  # pylint: disable=import-outside-toplevel
+        import PIL.Image  # pylint: disable=import-outside-toplevel
+        import PIL.ImageDraw  # pylint: disable=import-outside-toplevel
+        import PIL.ImageFont  # pylint: disable=import-outside-toplevel
+    except ImportError as error:
+        raise ScrambleError(f"image generation needs numpy and Pillow (python3-numpy and python3-pillow): {error}") from None
+    return numpy, PIL
+
+
+def cycles_per_pixel(cycles_per_mm, ppi):
+    return cycles_per_mm * 25.4 / ppi
+
+
+def srgb_encode(light):
+    """The sRGB transfer function (IEC 61966-2-1): linear light 0-1 to encoded values 0-1."""
+    np = imaging()[0]
+    light = np.asarray(light, dtype=np.float64)
+    return np.where(light <= 0.0031308, 12.92 * light, 1.055 * np.maximum(light, 0.0031308) ** (1 / 2.4) - 0.055)
+
+
+def srgb_decode(value):
+    np = imaging()[0]
+    value = np.asarray(value, dtype=np.float64)
+    return np.where(value <= 0.04045, value / 12.92, ((np.maximum(value, 0.04045) + 0.055) / 1.055) ** 2.4)
+
+
+def digit_masks(font_path, glyph_px, tile_px):
+    """Coverage (0-1, used as linear light) of the digits 0-9, glyph_px high and centred in square
+    tiles of tile_px on a common baseline. A variable font is set to its Bold instance."""
+    np, pil = imaging()
+
+    def face(size):
+        try:
+            font = pil.ImageFont.truetype(font_path, size)
+        except OSError as error:
+            raise ScrambleError(f"cannot load the font {font_path}: {error}") from None
+        try:
+            names = [name.decode() if isinstance(name, bytes) else name for name in font.get_variation_names()]
+        except OSError:  # not a variable font
+            names = []
+        if "Bold" in names:
+            font.set_variation_by_name("Bold")
+        return font
+
+    boxes = [face(200).getbbox(digit) for digit in "0123456789"]
+    font = face(round(200 * glyph_px / max(box[3] - box[1] for box in boxes)))
+    boxes = [font.getbbox(digit) for digit in "0123456789"]
+    top, bottom = min(box[1] for box in boxes), max(box[3] for box in boxes)
+    expect(max(*(box[2] - box[0] for box in boxes), bottom - top) + 4 <= tile_px,
+           f"digits {glyph_px} px high do not fit into {tile_px} px tiles")
+    masks = []
+    for digit, (left, _, right, _) in zip("0123456789", boxes, strict=True):
+        image = pil.Image.new("L", (tile_px, tile_px))
+        pil.ImageDraw.Draw(image).text(((tile_px - right - left) / 2, (tile_px - bottom - top) / 2), digit, font=font,
+                                       fill=255)
+        masks.append(np.asarray(image, dtype=np.float64) / 255)
+    return np.stack(masks)
+
+
+def button_mask(tile_px, diameter_px):
+    """Coverage of a centred disc: the button of the paper's white keypad (section 9)."""
+    np, pil = imaging()
+    scale = 8
+    image = pil.Image.new("L", (tile_px * scale, tile_px * scale))
+    start = (tile_px - diameter_px) * scale / 2
+    pil.ImageDraw.Draw(image).ellipse((start, start, start + diameter_px * scale - 1, start + diameter_px * scale - 1),
+                                      fill=255)
+    return np.asarray(image.resize((tile_px, tile_px), pil.Image.Resampling.BOX), dtype=np.float64) / 255
+
+
+def spatial_frequencies(size):
+    """Radial frequency in cycles per pixel on the rfft2 grid of a square tile of size pixels."""
+    np = imaging()[0]
+    return np.hypot(np.fft.fftfreq(size)[:, None], np.fft.rfftfreq(size)[None, :])
+
+
+def lowpass_gain(frequency, sigma):
+    """The paper's Gaussian low-pass (section 5.2); sigma is its width in cycles per pixel."""
+    np = imaging()[0]
+    return np.exp(-0.5 * (frequency / sigma) ** 2)
+
+
+def gaussian_highpass_gain(frequency, sigma):
+    """The paper's high-pass G_h = 1 - G (section 5.2): the complement of a Gaussian of width sigma (sigma_hf)."""
+    return 1 - lowpass_gain(frequency, sigma)
+
+
+def tapered_highpass_gain(frequency, lower, upper):
+    """The tapered high-pass: a raised-cosine step that passes nothing below lower and everything
+    above upper, so no trace of the digit is left at the low frequencies seen from a distance."""
+    np = imaging()[0]
+    step = np.clip((frequency - lower) / (upper - lower), 0, 1)
+    return 0.5 - 0.5 * np.cos(np.pi * step)
+
+
+def filtered(images, gain):
+    """Images filtered on their periodic DFT (as in the paper) with a gain on the rfft2 grid."""
+    np = imaging()[0]
+    return np.fft.irfft2(np.fft.rfft2(images) * gain, s=images.shape[-2:])
+
+
+def tile_light(mode, masks, high_gain, low_gain, design):
+    """Linear light of the tiles as {(decoy, digit): image}: hybrid gives one tile per decoy digit
+    (the standard digit of its column) and real digit, highpass and white one per real digit (decoy
+    None). design is a TileDesign."""
+    expect(mode in MASK_MODES, f"unknown masked digit mode '{mode}'")
+    pedestal = float(srgb_decode(design.pedestal_code / 255))
+    high = design.alpha * filtered(masks, high_gain)
+    if mode == "highpass":
+        return {(None, digit): pedestal + high[digit] for digit in range(10)}
+    if mode == "white":
+        expect(design.button is not None, "white mode needs a button mask")
+        decoy = design.beta * filtered(design.button[None], low_gain)[0]
+        return {(None, digit): pedestal + decoy + high[digit] for digit in range(10)}
+    decoys = design.beta * filtered(masks, low_gain)
+    return {(decoy, digit): pedestal + decoys[decoy] + high[digit] for decoy in range(10) for digit in range(10)}
+
+
+def displayable(light):
+    """The tiles' light as one array; light outside 0-1 is refused, never clipped."""
+    np = imaging()[0]
+    values = np.stack(list(light.values())).astype(np.float64)
+    low, high = float(values.min()), float(values.max())
+    expect(low >= -1e-9 and high <= 1 + 1e-9, f"masked digit tiles need light {low:.3f} to {high:.3f}, outside "
+           "the display range 0-1; lower decoy_amplitude or raise highpass_cutoff")
+    return values
+
+
+def tile_codes(light):
+    """8-bit sRGB codes of the tiles, each pixel rounded on its own."""
+    np = imaging()[0]
+    codes = np.rint(255 * srgb_encode(np.clip(displayable(light), 0, 1))).astype(np.uint8)
+    return dict(zip(light, codes))
+
+
+def diffused_codes(light):
+    """8-bit sRGB codes of the tiles with each pixel's rounding error spread in linear light to the
+    pixels not yet rounded (Floyd-Steinberg), which moves it above the high-pass cut-off. Rounding
+    each pixel on its own leaves a faint coarse trace of the digit."""
+    np = imaging()[0]
+    work = displayable(light)
+    codes = np.zeros(work.shape, dtype=np.uint8)
+    levels = srgb_decode(np.arange(256) / 255)
+    rows, columns = work.shape[1:]
+    for y in range(rows):
+        for x in range(columns):
+            codes[:, y, x] = np.rint(255 * srgb_encode(np.clip(work[:, y, x], 0, 1)))
+            error = work[:, y, x] - levels[codes[:, y, x]]
+            for dy, dx, share in ((0, 1, 7), (1, -1, 3), (1, 0, 5), (1, 1, 1)):
+                if y + dy < rows and 0 <= x + dx < columns:
+                    work[:, y + dy, x + dx] += error * share / 16
+    return dict(zip(light, codes))
+
+
+# The paper's sigma_lf (35 cycles per image, section 5.3) in cycles per mm of its phone screen
+# (2560 px at 493 ppi = 131.9 mm)
+PAPER_SIGMA_LF = 0.265
+PAPER_THRESHOLD = 0.93  # visibility index above which the user's keypad counts as unrecognisable (6.2.3)
+
+
+def observer_angles(width_mm, height_mm, observer):
+    """Visual angles in degrees of an image width_mm x height_mm centred at the origin, seen by an
+    Observer. Uses the endpoint vectors of the paper's equations 1-5 (its spherical equations 6-7
+    carry an extra factor 1/2)."""
+    distance, theta, phi = observer
+    x0 = distance * math.sin(theta) * math.sin(phi)
+    y0, z0 = distance * math.cos(theta), distance * math.sin(theta) * math.cos(phi)
+
+    def angle(first, second):
+        dot = sum(a * b for a, b in zip(first, second, strict=True))
+        return math.degrees(math.acos(dot / (math.hypot(*first) * math.hypot(*second))))
+
+    return (angle((-x0 - width_mm / 2, -y0, -z0), (-x0 + width_mm / 2, -y0, -z0)),
+            angle((-x0, -y0 + height_mm / 2, -z0), (-x0, -y0 - height_mm / 2, -z0)))
+
+
+def angle_factor(theta, phi, exponent=3):
+    """The paper's angle factor A: the DAF cut-off off axis (equation 9, with the absolute values it
+    lacks, so that the factor falls on both sides of the axis)."""
+    return ((1 - (abs(phi) / (math.pi / 2)) ** exponent)
+            * (1 - (abs(theta - math.pi / 2) / (math.pi / 2)) ** exponent))
+
+
+def daf_gain(cycles_per_degree, cutoff=31.0, ratio=3.0):
+    """Distance-as-filtering low-pass (Loftus and Harley; the paper's equation 8): gain 1 below
+    cutoff/ratio, 0 above cutoff, a quadratic fall in log frequency between."""
+    np = imaging()[0]
+    lower = cutoff / ratio
+    fall = 1 - (np.log(np.maximum(cycles_per_degree, 1e-300) / lower) / math.log(ratio)) ** 2
+    return np.where(cycles_per_degree < lower, 1.0, np.where(cycles_per_degree > cutoff, 0.0, fall))
+
+
+def seen_from(images, ppi, observer):
+    """Light of images as the visibility algorithm models an Observer: filtered with the DAF gain of
+    each frequency's perceived cycles per degree (section 6.1.1)."""
+    np = imaging()[0]
+    height, width = images.shape[-2:]
+    angle_x, angle_y = observer_angles(width * 25.4 / ppi, height * 25.4 / ppi, observer)
+    perceived = np.hypot(np.fft.fftfreq(height)[:, None] * height / angle_y, np.fft.rfftfreq(width)[None, :] * width / angle_x)
+    return filtered(images, daf_gain(perceived, 31.0 * angle_factor(observer.theta, observer.phi)))
+
+
+def mssim(first, second):
+    """Mean structural similarity (Wang et al. 2004: 11 x 11 Gaussian window of sigma 1.5,
+    K1 0.01, K2 0.03, dynamic range 1) of two images, valid windows only."""
+    np = imaging()[0]
+    offsets = np.arange(11) - 5
+    window = np.exp(-0.5 * (offsets[:, None] ** 2 + offsets[None, :] ** 2) / 1.5 ** 2)
+    window /= window.sum()
+
+    def local(image):
+        views = np.lib.stride_tricks.sliding_window_view(image, (11, 11))
+        return np.tensordot(views, window, axes=((-2, -1), (0, 1)))
+
+    mean_a, mean_b = local(first), local(second)
+    var_a, var_b = local(first * first) - mean_a ** 2, local(second * second) - mean_b ** 2
+    covariance = local(first * second) - mean_a * mean_b
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    return float(np.mean((2 * mean_a * mean_b + c1) * (2 * covariance + c2)
+                         / ((mean_a ** 2 + mean_b ** 2 + c1) * (var_a + var_b + c2))))
+
+
+def visibility_index(light, decoys, ppi, observer):
+    """The paper's visibility index (section 6.1.2) of a set of tiles: the mean structural similarity
+    of each tile and its decoy alone (decoys: {(decoy, digit): light}) as the Observer sees them;
+    tiles whose digit equals their decoy are left out. Each tile is padded with its own edge, so no
+    theme colour enters, and compared in sRGB-encoded light, as images are seen. 1 means no trace
+    of the real digit; the paper counts 0.93 and above as unrecognisable."""
+    np = imaging()[0]
+    keys = [key for key in light if key[0] != key[1]]
+    pad = next(iter(light.values())).shape[-1] // 4
+
+    def seen(images):
+        padded = np.pad(np.stack(images), ((0, 0), (pad, pad), (pad, pad)), mode="edge")
+        return srgb_encode(np.clip(seen_from(padded, ppi, observer)[:, pad:-pad, pad:-pad], 0, 1))
+
+    tiles, references = seen([light[key] for key in keys]), seen([decoys[key] for key in keys])
+    return float(np.mean([mssim(tile, reference) for tile, reference in zip(tiles, references, strict=True)]))
+
+
+def protection_width(make_light, ppi, observer, bounds, steps=24):
+    """The smallest high-pass parameter within bounds (rising values remove more of the real digit)
+    whose tiles reach the paper's threshold for the Observer (section 7.1: the protection distance,
+    30 degrees to the side); make_light(parameter) gives (light, decoys). None if even the upper
+    bound does not reach it."""
+    low, high = bounds
+    if visibility_index(*make_light(high), ppi, observer) < PAPER_THRESHOLD:
+        return None
+    for _ in range(steps):
+        middle = (low + high) / 2
+        if visibility_index(*make_light(middle), ppi, observer) >= PAPER_THRESHOLD:
+            high = middle
+        else:
+            low = middle
+    return high
+
+
+def plymouth_scale2(codes):
+    """The device pixels Plymouth (24.004.60, ply_pixels_interpolate) draws for an opaque grey image
+    of 8-bit codes on a display of device scale 2: every second device pixel is the bilinear mean of
+    its neighbours in encoded values, summed with truncation, so red, green and blue (bits 16, 8
+    and 0 of the pixel) round down differently. Returns the RGB codes, twice the size."""
+    np = imaging()[0]
+    source = np.asarray(codes, dtype=np.int64)
+    height, width = source.shape
+    across = np.minimum(np.arange(width) + 1, width - 1)
+    down = np.take(source, np.minimum(np.arange(height) + 1, height - 1), axis=0)
+    neighbours = (source, np.take(source, across, axis=1), down, np.take(down, across, axis=1))  # Plymouth's order
+    out = np.zeros((2 * height, 2 * width, 3), dtype=np.uint8)
+    for channel, shift in enumerate((16, 8, 0)):
+        for dy, dx in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            out[dy::2, dx::2, channel] = truncated_blend(neighbours, shift, dx / 2, dy / 2)
+    return out
+
+
+def truncated_blend(neighbours, shift, x, y):
+    """One channel (bit shift) of ply_pixels_interpolate at the fractional offsets x, y: the four
+    weighted neighbours added one by one to a 32-bit integer, which truncates each sum."""
+    np = imaging()[0]
+    value = np.zeros(neighbours[0].shape)
+    for term, weight in zip(neighbours, ((1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y), strict=True):
+        value = np.trunc(value + (term << shift).astype(np.float64) * weight)
+    return (value.astype(np.int64) & (0xFF << shift)) >> shift
+
+
+def device_light(rgb):
+    """Linear luminance (Rec. 709 weights) of RGB codes."""
+    np = imaging()[0]
+    return srgb_decode(rgb / 255) @ np.array([0.2126, 0.7152, 0.0722])
+
+
+def scale2_tile_codes(light, keep, iterations=12):
+    """8-bit codes of tiles for quantization = compensate at device scale 2. Plymouth's
+    interpolation in encoded values darkens textured pixels; that error, seen through the gain
+    keep (rfft2 grid of the tile) and averaged back to tile pixels, is fed back into the rounded
+    tile. The darkening it removes is nearly the same for every digit, while the rounding residue
+    it leaves differs per digit, so error diffusion leaves less of a coarse trace. Returns (codes,
+    remaining RMS error in linear light)."""
+    np = imaging()[0]
+    codes, worst = {}, 0.0
+    for key, image in light.items():
+        target, error = image.copy(), None
+        for _ in range(iterations):
+            current = np.rint(255 * srgb_encode(np.clip(target, 0, 1))).astype(np.uint8)
+            shown = device_light(plymouth_scale2(current))
+            mean = shown.reshape(image.shape[0], 2, image.shape[1], 2).mean(axis=(1, 3))
+            error = filtered(mean - image, keep)
+            target = target - error
+            expect(target.min() >= -1e-9 and target.max() <= 1 + 1e-9, "scale-2 compensation of a masked digit tile "
+                   "leaves the display range 0-1; lower decoy_amplitude or raise highpass_cutoff")
+        codes[key] = np.rint(255 * srgb_encode(np.clip(target, 0, 1))).astype(np.uint8)
+        worst = max(worst, float(np.sqrt(np.mean(error ** 2))))
+    return codes, worst
+
+
+def plymouth_device_scale(width, height, width_mm, height_mm, guess=False):
+    """The device scale Plymouth (24.004.60, get_device_scale) gives a display mode: 2 for 1200 or
+    more lines and, from the physical size, more than 192 dpi both ways; on simpledrm (guess) for
+    2560 or more columns. Sizes that encode the aspect ratio count as unknown."""
+    if height < 1200:
+        return 1
+    if guess:
+        return 2 if width >= 2560 else 1
+    if (width_mm, height_mm) in ((160, 90), (160, 100), (16, 9), (16, 10)):
+        return 1
+    return 2 if width_mm > 0 and height_mm > 0 and width / (width_mm / 25.4) > 192 and height / (
+        height_mm / 25.4) > 192 else 1
+
+
+# Tile design: tile and digit height in mm, high-pass and decoy gains in linear light, background
+# code, and the white keypad's button as a share of the tile
+TILE_MM, DIGIT_MM, ALPHA, BETA, PEDESTAL_CODE, BUTTON_SHARE = 9.0, 5.5, 0.35, 0.3, 130, 0.8
+MIN_TILE_PX = 24  # smaller tiles leave the high-pass digit too few pixels to read
+# Keypad layout in Plymouth logical pixels, shared with the overlay: the narrowest column (key cap
+# 30 px), the gap between columns, the margin of the digit panel, the key caps and arrows above the
+# digits with their gaps, and text digits at size 1 in points
+KEY_ROWS_PX, DIGIT_FONT_PT = 52, 20
+# The stock dialog below the screen centre (half the logo, prompt and field with their gaps, about
+# 170 px) and a bottom margin: the keypad has the rest of the screen height
+STOCK_BELOW_CENTRE_PX = 180
+
+
+def system_font():
+    """The bold sans-serif font of fontconfig, the family of the overlay's text."""
+    try:
+        path = subprocess.run(["fc-match", "-f", "%{file}", "Sans:bold"], capture_output=True, text=True,
+                              check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ScrambleError(f"cannot find the Sans font with fc-match: {error}") from None
+    expect(os.path.isfile(path), f"fontconfig names no font file for Sans:bold ({path!r})")
+    return path
+
+
+def preview_font(points, bold=False):
+    """A builder font at the default 96 dpi; the boot font may differ."""
+    pattern = "Sans:bold" if bold else "Sans"
+    result = subprocess.run(["fc-match", "-f", "%{file}", pattern], capture_output=True, text=True, check=False)
+    expect(result.returncode == 0 and os.path.isfile(result.stdout), f"fontconfig names no font file for {pattern}")
+    return imaging()[1].ImageFont.truetype(result.stdout, round(points * 96 / 72))
+
+
+def tile_targets(config, displays):
+    """The tile sets to make: one per scale Plymouth may give a connected display (its EDID rule
+    and its simpledrm guess), with the logical size the overlay recognises it by and the logical
+    density; duplicates merged. Without any display, one set for any screen. ppi sets the density;
+    a display without a physical size and no ppi gives targets without one (text digits)."""
+    targets = []
+    for connector, width, height, width_mm, height_mm in displays:
+        ppi = config.ppi or ((width * 25.4 / width_mm + height * 25.4 / height_mm) / 2 if width_mm and height_mm else None)
+        for scale in sorted({plymouth_device_scale(width, height, width_mm, height_mm),
+                             plymouth_device_scale(width, height, 0, 0, guess=True)}):
+            target = {"display": connector, "scale": scale, "width": width // scale, "height": height // scale,
+                      "ppi": round(ppi / scale, 2) if ppi else None}
+            if target not in targets:
+                targets.append(target)
+    if not targets:
+        targets.append({"display": "unknown", "scale": 1, "width": 0, "height": 0, "ppi": config.ppi})
+    return targets
+
+
+def estimated_safety_distance(light, decoys, ppi):
+    """The distance in cm from which the paper's visibility index reaches its threshold, 30 degrees
+    to the side (section 7.1): 0 if it does at 10 cm already, None if not even at 10 m."""
+    low, high = 100.0, 10000.0
+    if visibility_index(light, decoys, ppi, Observer(high)) < PAPER_THRESHOLD:
+        return None
+    if visibility_index(light, decoys, ppi, Observer(low)) >= PAPER_THRESHOLD:
+        return 0
+    for _ in range(16):
+        middle = (low + high) / 2
+        if visibility_index(light, decoys, ppi, Observer(middle)) >= PAPER_THRESHOLD:
+            high = middle
+        else:
+            low = middle
+    return round(high / 10)
+
+
+def tile_pixels(size, ppi):
+    """Side in pixels (even) of a tile at size times the default digit size and ppi pixels per inch."""
+    return 2 * round(TILE_MM * size * ppi / 25.4 / 2)
+
+
+def tile_maker(config, font, ppi, size=1.0):
+    """(make, tile_px, frequency) for tiles at ppi logical pixels per inch and size times the default
+    digit size: make(cutoff, keys) gives the (light, decoys) of the tiles for a high-pass cut-off in
+    cycles per mm, for the given keys or all. The cut-off stays in cycles per mm at any size; the
+    decoy's low-pass width scales with the digit, so a larger decoy keeps its blur."""
+    tile_px = tile_pixels(size, ppi)
+    masks = digit_masks(font, round(DIGIT_MM * size * ppi / 25.4), tile_px)
+    frequency = spatial_frequencies(tile_px)
+    low = lowpass_gain(frequency, cycles_per_pixel(config.lowpass_sigma / size, ppi))
+    design = TileDesign(ALPHA, PEDESTAL_CODE, config.decoy_amplitude,
+                        button_mask(tile_px, round(BUTTON_SHARE * tile_px)) if config.display == "white" else None)
+
+    def make(cutoff, keys=None):
+        lower = cycles_per_pixel(cutoff, ppi)
+        if config.highpass_filter == "tapered":  # upper edge twice the lower one, at most the Nyquist frequency
+            high = tapered_highpass_gain(frequency, lower, min(2 * lower, 0.5))
+        else:
+            high = gaussian_highpass_gain(frequency, lower)
+        light = tile_light(config.display, masks, high, low, design)
+        decoys = tile_light(config.display, masks, high, low, dataclasses.replace(design, alpha=0))
+        keys = keys or list(light)
+        return {key: light[key] for key in keys}, {key: decoys[key] for key in keys}
+
+    return make, tile_px, frequency
+
+
+def search_sample(display):
+    """The tiles the searches evaluate: 20 of the 90 hybrid tiles whose digit differs from its decoy,
+    or all 10 of the other modes."""
+    if display == "hybrid":
+        return [(key, (key + step) % 10) for key in range(10) for step in (1, 4)]
+    return [(None, digit) for digit in range(10)]
+
+
+def check_keypad_fit(config, target, tile_px, where):
+    """Refuses a digit size whose keypad does not fit the target's logical screen: the digit row
+    within the width less 40 px, key caps, arrows and digits below the stock dialog. Names the
+    largest size that fits."""
+    if not target["width"]:
+        return
+    row_width, row_height = keypad_row(tile_px, config.panel)
+    room_width = target["width"] - 40
+    room_height = target["height"] // 2 - STOCK_BELOW_CENTRE_PX - KEY_ROWS_PX
+    if row_width <= room_width and row_height <= room_height:
+        return
+    margin = row_height - tile_px
+    largest_tile = min((room_width - 9 * COLUMN_GAP - margin) // 10, room_height - margin)
+    largest = max(math.floor(20 * config.size * largest_tile / tile_px) / 20, 0)
+    raise ScrambleError(f"{where}: digits at size {config.size:g} need a digit row of {row_width}x{row_height} px, the "
+                        f"screen leaves {room_width}x{max(room_height, 0)} px under the key caps; use size {largest:g} "
+                        "or less")
+
+
+def finest_cutoff(config, ppi):
+    """The finest high-pass cut-off in cycles per mm a screen of ppi shows with room for the pattern:
+    0.35 (tapered: lower edge) or 0.3 (Gaussian: sigma) cycles per pixel, against the Nyquist
+    frequency of 0.5."""
+    return (0.35 if config.highpass_filter == "tapered" else 0.3) * ppi / 25.4
+
+
+def masked_digits_unavailable(config, target):
+    """Why a target cannot show masked digits, or None: no density known, tiles too small at the
+    configured size, or a cut-off (highpass_cutoff, else camera_floor) finer than its pixels. Such a
+    screen gets text digits."""
+    if not target["ppi"]:
+        return ("no configured screen has a physical size" if target["display"] == "unknown"
+                else "its physical size is not configured") + "; set ppi in the settings for masked digits"
+    tile_px = tile_pixels(config.size, target["ppi"])
+    if tile_px < MIN_TILE_PX:
+        return f"size {config.size:g} makes {tile_px} px tiles, under {MIN_TILE_PX} px"
+    limit = finest_cutoff(config, target["ppi"])
+    name, cutoff = (("highpass_cutoff", config.highpass_cutoff) if config.highpass_cutoff is not None
+                    else ("camera_floor", config.camera_floor or 0.1))
+    if cutoff > limit:
+        return f"{name} {cutoff:g} cycles per mm is finer than the screen shows (at most {limit:.2f})"
+    return None
+
+
+def highpass_cutoff(config, make, ppi, where):
+    """The high-pass cut-off in cycles per mm for tiles made by make (tile_maker) on a screen that can
+    show masked digits (masked_digits_unavailable): the configured one, or auto's search
+    (protection_width) from camera_floor up to the finest cut-off the screen shows."""
+    if config.highpass_cutoff is not None:
+        return config.highpass_cutoff
+    floor, limit = config.camera_floor or 0.1, finest_cutoff(config, ppi)
+    sample = search_sample(config.display)
+    cutoff = protection_width(lambda value: make(value, sample), ppi, Observer(10 * config.safety_distance), (floor, limit))
+    if cutoff is None:
+        reachable = estimated_safety_distance(*make(limit, sample), ppi)
+        raise ScrambleError(f"{where} cannot keep a safety distance of {config.safety_distance:g} cm (the paper's "
+                            f"model); the finest pattern it shows keeps an estimated {distance_text(reachable)}")
+    return cutoff
+
+
+def tile_set(config, font, target):
+    """Codes of the tiles of one target that can show masked digits (masked_digits_unavailable), their
+    size in pixels, the high-pass cut-off in cycles per mm and the estimated safety distance in cm.
+    auto runs the paper's search (protection_width) from camera_floor up to the finest cut-off the
+    screen can show. Search and estimate use the default digit size, the geometry the paper's
+    threshold fits: at a fixed cut-off the outline keeps its width while a larger digit grows, so the
+    per-tile MSSIM rises with size although the digit gets easier to read, and the tapered filter
+    leaves nothing below the cut-off at any size. The tiles are drawn at the configured size with
+    that cut-off."""
+    ppi = target["ppi"]
+    where = f"display {target_text(target)}"
+    tile_px = tile_pixels(config.size, ppi)
+    check_keypad_fit(config, target, tile_px, where)
+    make, _, frequency = tile_maker(config, font, ppi)
+    cutoff = highpass_cutoff(config, make, ppi, where)
+    estimate = estimated_safety_distance(*make(cutoff, search_sample(config.display)), ppi)
+    if config.size != 1:
+        make, _, frequency = tile_maker(config, font, ppi, config.size)
+    light, _ = make(cutoff)
+    if config.quantization == "diffusion":
+        codes = diffused_codes(light)
+    elif config.quantization == "compensate" and target["scale"] == 2:
+        codes, _ = scale2_tile_codes(light, (frequency < cycles_per_pixel(cutoff, ppi)).astype(float))
+    else:
+        codes = tile_codes(light)
+    return codes, tile_px, cutoff, estimate
+
+
+def tile_png(codes):
+    """An opaque 8-bit RGB PNG of a grey tile."""
+    np, pil = imaging()
+    buffer = io.BytesIO()
+    pil.Image.fromarray(np.repeat(codes[..., None], 3, axis=2)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def tile_files(config, font, prefix, target):
+    """PNG files of the tile set of one target as {name: bytes}, and its manifest entry."""
+    codes, tile_px, cutoff, estimate = tile_set(config, font, target)
+    names = {prefix + ("" if decoy is None else f"{decoy}-") + f"{digit}.png": tile_png(image)
+             for (decoy, digit), image in sorted(codes.items(), key=str)}
+    tiles = {**target, "prefix": prefix, "cell": tile_px, "cutoff": round(cutoff, 3), "estimated_safety_distance_cm": estimate,
+             "files": {name: hashlib.sha256(data).hexdigest() for name, data in names.items()}}
+    if config.panel:
+        # one opaque panel in the background code under the digit row, so no gap shows between tiles
+        width, height = keypad_row(tile_px, True)
+        panel = tile_png(imaging()[0].full((height, width), PEDESTAL_CODE, dtype="uint8"))
+        tiles["panel"] = {"name": prefix + "panel.png", "width": width, "height": height,
+                          "sha256": hashlib.sha256(panel).hexdigest()}
+        names[prefix + "panel.png"] = panel
+    return names, tiles
+
+
+def make_tiles(config, displays, font):
+    """PNG files of the tile sets for the connected displays as {name: bytes}, and their manifest
+    (names with SHA-256, design and estimates) for the overlay and the image validation. A target
+    that cannot show masked digits gets a text set: its size and the reason, no files."""
+    with open(font, "rb") as stream:
+        font_hash = hashlib.sha256(stream.read()).hexdigest()
+    files, sets = {}, []
+    for index, target in enumerate(tile_targets(config, displays)):
+        reason = masked_digits_unavailable(config, target)
+        if reason:
+            sets.append({**target, "text": reason})
+            continue
+        names, tiles = tile_files(config, font, f"{TILE_PREFIX}{index}-", target)
+        files.update(names)
+        sets.append(tiles)
+    return files, {"version": 1, "display": config.display, "highpass_filter": config.highpass_filter,
+                   "safety_distance_cm": config.safety_distance, "camera_floor": config.camera_floor,
+                   "lowpass_sigma": config.lowpass_sigma, "quantization": config.quantization, "size": config.size,
+                   "panel": config.panel, "decoy_amplitude": config.decoy_amplitude,
+                   "font": {"file": os.path.basename(font), "sha256": font_hash}, "sets": sets}
+
+
+def build_theme(config, displays=None):
+    """Complete theme files and optional tile manifest, ready for the dom0 importer."""
+    screens = config.screens if displays is None else displays
+    files, manifest = make_tiles(config, screens, system_font()) if config.display != "text" else ({}, None)
+    template = read(os.path.join(SOURCE_DIR, "theme", "keypad.script.in"))
+    files["keypad.script"] = render_overlay(config, template, manifest).encode("ascii")
+    for name in IMAGES:
+        files[name] = Path(SOURCE_DIR, "theme", name).read_bytes()
+    if manifest:
+        files[TILE_MANIFEST] = (json.dumps(manifest, indent=1, ensure_ascii=True) + "\n").encode("ascii")
+    expect(len(files) <= base.THEME_MAX_FILES and sum(map(len, files.values())) <= base.THEME_MAX_BYTES,
+           "theme exceeds the import limit; reduce the number of screens or digit size")
+    return files, manifest
+
+
+def write_theme(config, built=None):
+    """Atomically save an uncompressed archive after the dom0 importer accepts it."""
+    files, _manifest = build_theme(config) if built is None else built
+    output = Path(config.output)
+    output.mkdir(parents=True, exist_ok=True)
+    destination = output / THEME_ARCHIVE
+    with tempfile.TemporaryDirectory(prefix=".theme-", dir=output) as scratch:
+        archive_path = Path(scratch, THEME_ARCHIVE)
+        with tarfile.open(archive_path, "w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, data in sorted(files.items()):
+                entry = tarfile.TarInfo(name)
+                entry.size, entry.mode, entry.uid, entry.gid, entry.mtime = len(data), 0o644, 0, 0, 0
+                archive.addfile(entry, io.BytesIO(data))
+        unpacked = Path(scratch, "check")
+        unpacked.mkdir()
+        base.import_theme(str(archive_path), str(unpacked))
+        with archive_path.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(archive_path, destination)
+    return destination
+
+
+def text_image(text, points, color, bold=False):
+    """A transparent text sprite, including font ascent and descent like a text layout."""
+    pil = imaging()[1]
+    font = preview_font(points, bold)
+    ascent, descent = font.getmetrics()
+    left, _, right, _ = font.getbbox(text)
+    image = pil.Image.new("RGBA", (max(1, math.ceil(max(font.getlength(text), right - left))), ascent + descent))
+    pil.ImageDraw.Draw(image).text((-min(left, 0), 0), text, font=font, fill=(*color, 255))
+    return image
+
+
+def scale_sprite(image, scale):
+    """Scale one sprite using Plymouth's interpolation; tiles keep their exact device pixels."""
+    if scale == 1:
+        return image.convert("RGBA")
+    np, pil = imaging()
+    source = np.asarray(image.convert("RGBA"), dtype=np.int64).copy()
+    source[:, :, :3] = source[:, :, :3] * source[:, :, 3:] // 255
+    height, width = source.shape[:2]
+    across = np.minimum(np.arange(width) + 1, width - 1)
+    down = np.take(source, np.minimum(np.arange(height) + 1, height - 1), axis=0)
+    result = np.zeros((height * 2, width * 2, 4), dtype=np.uint8)
+    for channel, shift in enumerate((16, 8, 0, 24)):
+        neighbours = tuple(item[:, :, channel] for item in
+                           (source, np.take(source, across, axis=1), down, np.take(down, across, axis=1)))
+        for dy, dx in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            result[dy::2, dx::2, channel] = truncated_blend(neighbours, shift, dx / 2, dy / 2)
+    result[:, :, :3] = np.minimum(255, result[:, :, :3].astype(np.uint32) * 255
+                                 // np.maximum(result[:, :, 3:].astype(np.uint32), 1))
+    return pil.Image.fromarray(result)
+
+
+def preview_columns(config, png, entry):
+    """Key labels, mapped digits and optional letter sprites, with their common column width."""
+    masked = "prefix" in entry
+    cell = max(CAP_CELL, entry.get("cell", 0))
+    columns = []
+    for key in (1, 2, 3, 4, 5, 6, 7, 8, 9, 0):
+        digit = int("7302915864"[key])
+        name = entry.get("prefix", "") + (f"{key}-" if config.display == "hybrid" else "") + f"{digit}.png"
+        color = tuple(round(255 * channel) for channel in config.colors[digit])
+        image = png(name) if masked else text_image(str(digit), round(DIGIT_FONT_PT * config.size), color, True)
+        letters = text_image(config.letters[digit], 9, (184, 191, 204)) if config.letters[digit] else None
+        columns.append((text_image(str(key), 12, (217, 222, 230)), image, letters))
+        if not masked:
+            cell = max(cell, image.width + 4)
+    return columns, cell
+
+
+def place_preview_column(put, column, items, images, geometry):
+    """Place one column's sprites at the positions used by the overlay."""
+    cap, arrow = images
+    cell, row = geometry
+    label, digit, letter = items
+    left = PANEL_MARGIN + column * (cell + COLUMN_GAP)
+    for image, offset in ((cap, 0), (label, (cap.height - label.height) // 2), (arrow, cap.height + 5), (digit, row)):
+        put(image, left + (cell - image.width) // 2, PANEL_MARGIN + offset)
+    if letter:
+        put(letter, left + (cell - letter.width) // 2, PANEL_MARGIN + row + digit.height)
+
+
+def preview_keypad(config, files, entry):
+    """Draw the example map with the overlay's column order, gaps, panel and individual sprites."""
+    pil = imaging()[1]
+
+    def png(name):
+        with pil.Image.open(io.BytesIO(files[name])) as image:
+            return image.convert("RGBA")
+
+    images = png(IMAGES[0]), png(IMAGES[1])
+    columns, cell = preview_columns(config, png, entry)
+    panel = png(entry["panel"]["name"]) if "panel" in entry else None
+    row = images[0].height + 5 + images[1].height + 3 + (PANEL_MARGIN if panel else 0)
+    size = ((10 * cell + 9 * COLUMN_GAP + 2 * PANEL_MARGIN) * entry["scale"],
+            (row + max(digit.height + (letter.height if letter else 0) for _, digit, letter in columns)
+             + 2 * PANEL_MARGIN) * entry["scale"])
+    result = pil.Image.new("RGBA", size, (50, 55, 62, 255))
+
+    def put(image, x, y):
+        result.alpha_composite(scale_sprite(image, entry["scale"]), (x * entry["scale"], y * entry["scale"]))
+
+    if panel:
+        put(panel, 0, row)
+    for column, items in enumerate(columns):
+        place_preview_column(put, column, items, images, (cell, row))
+    return result.convert("RGB")
+
+
+def preview_captions(config, entry):
+    """Geometry, model estimates and limitations shown above the preview."""
+    captions = [target_text(entry), "Keypad at 1:1 device pixels; viewer zoom must be 100%."]
+    captions.append("Text uses the builder's font; the initramfs font can differ.")
+    if "cutoff" in entry:
+        captions.append(f"Size {config.size:g}; decoy amplitude {config.decoy_amplitude:g}; tile {entry['cell']} px; "
+                        f"cut-off {entry['cutoff']} cycles/mm; estimated safety distance "
+                        f"{distance_text(entry['estimated_safety_distance_cm'])}.")
+    if "text" in entry:
+        captions.append("Text fallback: " + entry["text"])
+    return captions + config.screen_notes
+
+
+def preview_onlooker(config, keypad, entry):
+    """The distance-as-filtering luminance prediction, or a labelled empty view without density."""
+    np, pil = imaging()
+    observer_caption = f"Onlooker model at {config.safety_distance:g} cm, 30 degrees to the side; not a guarantee."
+    if entry["ppi"]:
+        # The filter wraps around its input: a border of repeated edge pixels keeps that out of the view
+        border = keypad.height // 2
+        luminance = np.pad(device_light(np.asarray(keypad)), border, mode="edge")
+        viewed = seen_from(luminance, entry["ppi"] * entry["scale"], Observer(10 * config.safety_distance))
+        viewed = viewed[border:-border, border:-border]
+        codes = np.rint(255 * srgb_encode(np.clip(viewed, 0, 1))).astype(np.uint8)
+        onlooker = pil.Image.fromarray(codes).convert("RGB")
+    else:
+        onlooker = pil.Image.new("RGB", keypad.size, (50, 55, 62))
+        observer_caption = "Onlooker model unavailable: set screens with physical dimensions, or ppi."
+    return onlooker, observer_caption
+
+
+def preview_image(config):
+    """The first target at device-pixel size and its distance-as-filtering luminance prediction."""
+    files, manifest = build_theme(config, config.screens[:1])
+    entry = manifest["sets"][0] if manifest else tile_targets(config, config.screens[:1])[0]
+    keypad = preview_keypad(config, files, entry)
+    return compose_preview(keypad, preview_onlooker(config, keypad, entry), preview_captions(config, entry))
+
+
+def compose_preview(keypad, observer, captions):
+    """Stack the keypad, onlooker image and captions without resizing either image."""
+    pil = imaging()[1]
+    onlooker, observer_caption = observer
+    font = preview_font(10)
+    line_height = sum(font.getmetrics()) + 4
+    width = max(keypad.width, math.ceil(max(font.getlength(line) for line in [*captions, observer_caption]))) + 24
+    height = 2 * keypad.height + (len(captions) + 1) * line_height + 48
+    result = pil.Image.new("RGB", (width, height), (50, 55, 62))
+    draw = pil.ImageDraw.Draw(result)
+    for index, line in enumerate(captions):
+        draw.text((12, 12 + index * line_height), line, font=font, fill=(220, 223, 230))
+    top = 12 + len(captions) * line_height
+    result.paste(keypad, (12, top))
+    draw.text((12, top + keypad.height + 12), observer_caption, font=font, fill=(220, 223, 230))
+    result.paste(onlooker, (12, top + keypad.height + 12 + line_height))
+    return result
+
+
+def show_or_save(image, output):
+    """Show a preview with the desktop viewer; without a display or a working viewer, save it in
+    the output directory and return its path."""
+    viewer = shutil.which("xdg-open")
+    if viewer and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        # The viewer reads the file after xdg-open returns, so the temporary file stays
+        descriptor, shown = tempfile.mkstemp(prefix=f"{PROG}-", suffix=".png")
+        with os.fdopen(descriptor, "wb") as stream:
+            image.save(stream, format="PNG")
+        try:
+            result = subprocess.run([viewer, shown], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, check=False)
+            if result.returncode == 0:
+                print(f"{PROG}: preview opened ({shown})")
+                return None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        os.unlink(shown)
+    destination = Path(output)
+    destination.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    path = destination / f"preview-{stamp}.png"
+    image.save(path, format="PNG")
+    print(f"{PROG}: preview saved to {path}")
+    return path
+
+
+def transfer_commands(path):
+    """The dom0 commands that copy and apply an archive, the copy as the Qubes documentation gives
+    it; the path is quoted for the qube's shell and the command for dom0's."""
+    try:
+        result = subprocess.run(["qubesdb-read", "/name"], capture_output=True, text=True, check=False)
+        name = result.stdout.strip()
+    except OSError:
+        name = ""
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,30}", name):
+        name = "BUILDER_QUBE"
+    return (shlex.join(["qvm-run", "--pass-io", name, shlex.join(["cat", "--", str(path)])]) + " > " + shlex.quote(path.name),
+            shlex.join(["sudo", "qubes-plymouth-scramble", "apply", path.name]))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__)
+    parser.add_argument("--preview", action="store_true", help="view the first screen's keypad and onlooker model")
+    args = parser.parse_args(argv)
+    try:
+        path = Path(CONFIG_FILE)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="ascii") as stream:
+                stream.write(read(os.path.join(SOURCE_DIR, "qubes-plymouth-scramble.conf")))
+            print(f"{PROG}: created {path}; set screens in that file and run again")
+            return 0
+        config = Config(path)
+        if args.preview:
+            show_or_save(preview_image(config), config.output)
+            return 0
+        built = build_theme(config)
+        archive = write_theme(config, built)
+        print(tile_summary(built[1]) if built[1] else "Text digits (unmasked)")
+        for note in config.screen_notes:
+            print(f"{PROG}: note: {note}")
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        print(f"SHA-256: {digest}  {archive.name}\nRun in dom0:")
+        print("\n".join(transfer_commands(archive)))
+    except (ScrambleError, OSError, ValueError, tarfile.TarError) as error:
+        print(f"{PROG}: error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

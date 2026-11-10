@@ -1,3 +1,24 @@
+Noteworthy changes in release 0.2.0
+
+* Self-contained dom0 RPM and VM theme builder
+
+  The RPM installs the management tool and dracut module. Completed themes
+  are generated in a VM and applied in dom0; later dracut builds need no VM.
+  Settings and image-generation dependencies stay outside dom0. apply and
+  remove replace install and uninstall; package removal restores stock images.
+
+* Preview and builder settings
+
+  --preview opens a PNG or prints its saved path. screens and output are
+  settings. decoy_amplitude defaults to 0.3; zero replaces display = highpass.
+  The enabled setting and dom0 configuration file are removed.
+
+Migration from 0.1.x: copy /etc/qubes-plymouth-scramble.conf into the builder
+before running the old sudo qubes-plymouth-scramble uninstall, which deletes it.
+Use that file as ~/.config/qubes-plymouth-scramble.conf in the builder, remove
+enabled, set screens, and replace display = highpass with display = hybrid and
+decoy_amplitude = 0. Install the RPM, generate a theme in the VM and apply it in dom0.
+
 Noteworthy changes in release 0.1.3
 
 * Digit size and digit panel
